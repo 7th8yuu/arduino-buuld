@@ -9,6 +9,15 @@
   Board: ESP8266 core 3.x -> NodeMCU 1.0 hoac LOLIN(WEMOS) D1 mini
   Dau day: chan data LED -> D2 (GPIO4) qua dien tro ~330 ohm, GND LED noi chung GND ESP,
            nguon 5V LED cap rieng (du dong), tot nhat co IC doi muc 3.3V->5V (74AHCT125).
+
+  Den bao trang thai (LED xanh tren module ESP, GPIO2):
+    nhay cham (0.6 s)      = dang tim/noi WiFi nha
+    nhay nhanh (0.15 s)    = dang phat WiFi "LED-Setup" (AP)
+    nhay ngan moi 3 giay   = da vao WiFi nha, binh thuong
+  Nut FLASH (GPIO0) tren NodeMCU: giu 2 giay = mo AP "LED-Setup" va GIU MO (khong tu dong dong).
+    Noi dien thoai vao "LED-Setup" roi mo http://192.168.4.1 de dieu khien truc tiep, khong
+    can qua router. Giu 2 giay lan nua = dong AP.
+  Serial 115200: in MAC, IP, gateway, RSSI luc vao WiFi va moi 15 giay.
 */
 
 #include <ESP8266WiFi.h>
@@ -27,6 +36,9 @@
 #define AP_PASS        "12345678" // >= 8 ky tu; de "" neu muon AP mo
 #define HOSTNAME       "ledctl"   // truy cap http://ledctl.local
 #define AP_CLOSE_MS    60000UL    // AP tu dong sau khi ket noi thanh cong
+#define STATUS_LED     2          // LED xanh tren module ESP-12 (GPIO2, sang khi muc LOW); -1 = khong dung
+#define BTN_PIN        0          // nut FLASH tren NodeMCU (GPIO0); -1 = khong dung
+#define BTN_HOLD_MS    2000UL     // giu nut lau hon the nay thi mo/dong AP "LED-Setup"
 // ======================================================
 
 #define MAGIC 0x4C454433UL
@@ -57,6 +69,7 @@ static uint8_t buf[MAX_LEDS][3];   // bo dem mau logic (R,G,B)
 
 // trang thai chay
 bool     portalActive = false, bootConn = false, closeApReq = false;
+bool     manualAp = false;                 // AP mo bang nut: khong tu dong dong
 bool     dirty = true, countChanged = false, powerChanged = false;
 enum { C_IDLE, C_CONNECTING, C_OK, C_FAIL } connState = C_IDLE;
 bool     connectReq = false;
@@ -260,7 +273,8 @@ void applyPower() {
   } else {
     strip.clear(); strip.show();
     if (LED_POWER_PIN >= 0) digitalWrite(LED_POWER_PIN, !LED_POWER_ON);
-    if (!portalActive && WiFi.status() == WL_CONNECTED) WiFi.setSleepMode(WIFI_MODEM_SLEEP, 3);
+    // thuc moi nhip DTIM cua router (khong bo qua) de van tra loi ARP/HTTP on dinh khi "ngu"
+    if (!portalActive && WiFi.status() == WL_CONNECTED) WiFi.setSleepMode(WIFI_MODEM_SLEEP);
   }
 }
 
@@ -305,13 +319,14 @@ void closePortal() {
   dns.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
-  portalActive = false; closeApReq = false;
+  portalActive = false; closeApReq = false; manualAp = false;
   applyPower();
   Serial.println(F("Da dong AP"));
 }
 
 void onConnected() {
-  Serial.print(F("IP: ")); Serial.println(WiFi.localIP());
+  Serial.printf("WiFi OK  MAC=%s  IP=%s  GW=%s  RSSI=%d\n", WiFi.macAddress().c_str(),
+                WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(), (int)WiFi.RSSI());
   MDNS.begin(HOSTNAME);
   MDNS.addService("http", "tcp", 80);
   applyPower();
@@ -347,7 +362,7 @@ void wifiTask() {
   // ESP tu noi lai router khi portal dang mo -> coi nhu xong, AP se tu dong
   if (portalActive && connState == C_IDLE && conn) { connState = C_OK; okAt = millis(); }
 
-  if (portalActive && connState == C_OK && (closeApReq || millis() - okAt > AP_CLOSE_MS)) closePortal();
+  if (portalActive && connState == C_OK && (closeApReq || (!manualAp && millis() - okAt > AP_CLOSE_MS))) closePortal();
 
   if (bootConn) {
     if (conn) bootConn = false;
@@ -362,13 +377,48 @@ void wifiTask() {
   }
 }
 
+// ====================== DEN TRANG THAI / NUT / CHAN DOAN ======================
+void statusTask() {
+  if (STATUS_LED < 0) return;
+  uint32_t t = millis();
+  bool on;
+  if (portalActive)                        on = (t % 300) < 150;     // dang phat AP: nhay nhanh
+  else if (WiFi.status() == WL_CONNECTED)  on = (t % 3000) < 80;     // da vao WiFi: nhay ngan moi 3 giay
+  else                                     on = (t % 1200) < 600;    // dang tim WiFi: nhay cham
+  digitalWrite(STATUS_LED, on ? LOW : HIGH);
+}
+
+// Giu nut FLASH >= BTN_HOLD_MS: mo AP va giu mo; giu lan nua: dong AP (chi khi da co WiFi nha)
+void buttonTask() {
+  if (BTN_PIN < 0) return;
+  static uint32_t downAt = 0;
+  static bool fired = false;
+  if (digitalRead(BTN_PIN) != LOW) { downAt = 0; fired = false; return; }
+  if (!downAt) { downAt = millis() | 1; return; }
+  if (fired || millis() - downAt < BTN_HOLD_MS) return;
+  fired = true;
+  if (!portalActive)  { manualAp = true; startPortal(); }
+  else if (!manualAp) { manualAp = true; }                           // dang dem nguoc dong AP -> giu mo
+  else if (WiFi.status() == WL_CONNECTED) closePortal();
+}
+
+void netReport() {
+  static uint32_t last = 0;
+  if (millis() - last < 15000) return;
+  last = millis();
+  Serial.printf("[net] wifi=%d ip=%s gw=%s rssi=%d ap=%d heap=%u\n", (int)WiFi.status(),
+                WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
+                (int)WiFi.RSSI(), portalActive ? 1 : 0, (unsigned)ESP.getFreeHeap());
+}
+
 // ====================== HTTP ======================
 void sendJson(const String& s) { server.send(200, "application/json", s); }
 
 void handleRoot() {
-  if (portalActive && server.client().localIP() == WiFi.softAPIP())
+  bool fromAp = portalActive && server.client().localIP() == WiFi.softAPIP();
+  if (fromAp && !manualAp)                                   // AP cai dat WiFi
     server.send_P(200, "text/html; charset=utf-8", PAGE_PORTAL);
-  else
+  else                                                       // WiFi nha, hoac AP mo bang nut -> trang dieu khien
     server.send_P(200, "text/html; charset=utf-8", PAGE_APP);
 }
 
@@ -524,12 +574,17 @@ void setup() {
     pinMode(LED_POWER_PIN, OUTPUT);
     digitalWrite(LED_POWER_PIN, S.on ? LED_POWER_ON : !LED_POWER_ON);
   }
+  if (STATUS_LED >= 0) { pinMode(STATUS_LED, OUTPUT); digitalWrite(STATUS_LED, HIGH); }
+  if (BTN_PIN >= 0) pinMode(BTN_PIN, INPUT_PULLUP);
   strip.begin(); strip.clear(); strip.show();
   strip.updateLength(S.count);
   dirty = true;
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);          // tat ngu modem: tranh bo lo ARP/HTTP tu dien thoai
   WiFi.hostname(HOSTNAME);
+  Serial.printf("\nLED Controller | MAC=%s | hostname=%s | LED=%u | on=%u\n",
+                WiFi.macAddress().c_str(), HOSTNAME, (unsigned)S.count, (unsigned)S.on);
   if (S.ssid[0]) { WiFi.begin(S.ssid, S.pass); bootConn = true; bootStart = millis(); }
   else startPortal();
 
@@ -558,6 +613,9 @@ void loop() {
   if (portalActive) dns.processNextRequest();
   MDNS.update();
   wifiTask();
+  buttonTask();
+  statusTask();
+  netReport();
   ledTask();
   if (saveAt && (int32_t)(millis() - saveAt) >= 0) { saveAt = 0; saveSettings(); }
   delay(S.on ? 1 : 4);
