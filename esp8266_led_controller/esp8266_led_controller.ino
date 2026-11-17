@@ -9,6 +9,10 @@
   Board: ESP8266 core 3.x -> NodeMCU 1.0 hoac LOLIN(WEMOS) D1 mini
   Dau day: chan data LED -> D2 (GPIO4) qua dien tro ~330 ohm, GND LED noi chung GND ESP,
            nguon 5V LED cap rieng (du dong), tot nhat co IC doi muc 3.3V->5V (74AHCT125).
+           CHI 1 CHAN DATA (D2) cho ca 2 doan: data di ESP -> doan 1 -> doan 2.
+  Cap nguon 2 dau (chong sut ap): 5V+GND cap o dau doan 1 VA o dau cuoi doan 2.
+           GND cua 2 nguon + GND ESP phai noi chung. Cat day +5V o cho noi giua 2 doan
+           (giu nguyen GND va DATA) de 2 nguon khong day nguoc vao nhau.
 
   Den bao trang thai (LED xanh tren module ESP, GPIO2):
     nhay cham (0.6 s)      = dang tim/noi WiFi nha
@@ -39,9 +43,12 @@
 #define STATUS_LED     2          // LED xanh tren module ESP-12 (GPIO2, sang khi muc LOW); -1 = khong dung
 #define BTN_PIN        0          // nut FLASH tren NodeMCU (GPIO0); -1 = khong dung
 #define BTN_HOLD_MS    2000UL     // giu nut lau hon the nay thi mo/dong AP "LED-Setup"
+#define AUTO_REFRESH_MS 4000UL    // gui lai khung tinh moi 4 giay: LED bi reset do sut nguon se tu sang lai
 // ======================================================
 
-#define MAGIC 0x4C454433UL
+#define WMAGIC 0x4C454433UL       // vung WiFi (giu nguyen ma cu de khong mat WiFi da luu)
+#define LMAGIC 0x4C454435UL       // vung cai dat LED
+#define LED_EEPROM_OFF 128        // cai dat LED luu tu byte 128, WiFi o byte 0
 
 enum { MODE_SOLID, MODE_BREATHE, MODE_RAINBOW, MODE_SPREAD, MODE_THEATER,
        MODE_COMET, MODE_TWINKLE, MODE_SCANNER, MODE_GRADIENT, MODE_COUNT };
@@ -50,15 +57,19 @@ enum { MODE_SOLID, MODE_BREATHE, MODE_RAINBOW, MODE_SPREAD, MODE_THEATER,
 // 0 RGB, 1 RBG, 2 GRB, 3 GBR, 4 BRG, 5 BGR
 const uint8_t PERM[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
 
-struct Settings {
+struct WifiCfg {                      // EEPROM byte 0
   uint32_t magic;
   char     ssid[33];
   char     pass[65];
+};
+struct Settings {                     // EEPROM byte LED_EEPROM_OFF
+  uint32_t magic;
   uint8_t  on, bright, mode, speed;
   uint8_t  c1[3], c2[3];
   uint8_t  o1, o2, zoneOn, pad;
   uint16_t count, split, zs, ze;
 };
+WifiCfg  W;
 Settings S;
 
 Adafruit_NeoPixel strip(MAX_LEDS, LED_PIN, NEO_RGB + NEO_KHZ800);
@@ -78,6 +89,9 @@ uint32_t connStart = 0, okAt = 0, bootStart = 0, saveAt = 0, lostAt = 0;
 uint32_t lastFrame = 0, phaseAcc = 0;
 uint16_t ph = 0;
 uint8_t  testSeg = 0, testC = 0; bool testRaw = false; uint32_t testUntil = 0;
+bool     refreshReq = false;               // yeu cau lam moi toan bo LED
+uint8_t  resendFrames = 0;                 // gui lai khung hinh vai lan sau khi doi cau hinh
+uint32_t lastPush = 0;                     // lan gui cuoi ra day LED
 
 // ====================== TRANG WEB (PROGMEM) ======================
 #include "web_pages.h"
@@ -105,34 +119,40 @@ static void setC(uint8_t* c, uint8_t r, uint8_t g, uint8_t b) { c[0] = r; c[1] =
 // ====================== CAI DAT (EEPROM) ======================
 void defaults() {
   memset(&S, 0, sizeof(S));
-  S.magic = MAGIC; S.on = 1; S.bright = 128; S.speed = 128; S.mode = MODE_SOLID;
+  S.magic = LMAGIC; S.on = 1; S.bright = 128; S.speed = 128; S.mode = MODE_SOLID;
   setC(S.c1, 255, 0, 0); setC(S.c2, 0, 0, 255);
-  S.count = 60 < MAX_LEDS ? 60 : MAX_LEDS;
-  S.split = S.count / 2;
+  S.count = 146 < MAX_LEDS ? 146 : MAX_LEDS;   // tong 146 LED
+  S.split = 49 < S.count ? 49 : S.count;       // doan 1 = LED 1..49, doan 2 = LED 50..146
   S.o1 = 0; S.o2 = 2;                  // RGB (WS2811) + GRB (WS2812) - chinh lai tren web
   S.zs = 1; S.ze = 10;
 }
 
 void sanitize() {
   S.count = clampL(S.count, 1, MAX_LEDS);
-  S.split = clampL(S.split, 1, S.count);
+  S.split = clampL(S.split, 1, MAX_LEDS);      // giu gia tri nguoi dung chon; luc dung se cat theo count
   if (S.mode >= MODE_COUNT) S.mode = 0;
   if (S.o1 > 5) S.o1 = 0;
   if (S.o2 > 5) S.o2 = 0;
   S.bright = clampL(S.bright, 1, 255);
   S.speed  = clampL(S.speed, 1, 255);
-  S.zs = clampL(S.zs, 1, S.count);
-  S.ze = clampL(S.ze, S.zs, S.count);
+  S.zs = clampL(S.zs, 1, MAX_LEDS);
+  S.ze = clampL(S.ze, S.zs, MAX_LEDS);
   S.on = S.on ? 1 : 0; S.zoneOn = S.zoneOn ? 1 : 0;
-  S.ssid[32] = 0; S.pass[64] = 0;
 }
 
+// diem chia 2 doan dang dung that su (cat theo so LED hien tai, khong lam mat gia tri da luu)
+static inline uint16_t effSplit() { return S.split < S.count ? S.split : S.count; }
+
 void loadSettings() {
-  EEPROM.get(0, S);
-  if (S.magic != MAGIC) defaults();
+  EEPROM.get(0, W);
+  if (W.magic != WMAGIC) { memset(&W, 0, sizeof(W)); W.magic = WMAGIC; }
+  W.ssid[32] = 0; W.pass[64] = 0;
+  EEPROM.get(LED_EEPROM_OFF, S);
+  if (S.magic != LMAGIC) defaults();
   sanitize();
 }
-void saveSettings() { EEPROM.put(0, S); EEPROM.commit(); }
+void saveSettings() { EEPROM.put(LED_EEPROM_OFF, S); EEPROM.commit(); }
+void saveWifi()     { EEPROM.put(0, W); EEPROM.commit(); }
 
 // ====================== HIEU UNG ======================
 static inline void setPx(uint16_t i, const uint8_t* c) { buf[i][0] = c[0]; buf[i][1] = c[1]; buf[i][2] = c[2]; }
@@ -160,7 +180,11 @@ static void fadeToBg(uint16_t lo, uint16_t hi, const uint8_t* bg, uint8_t shift)
 void renderFrame() {
   const uint16_t n = S.count;
   uint16_t lo = 0, hi = n;
-  if (S.zoneOn) { lo = S.zs - 1; hi = S.ze; }          // vung [lo, hi) tinh tu 0
+  if (S.zoneOn) {                                      // vung [lo, hi) tinh tu 0, cat theo so LED hien tai
+    uint16_t zs = S.zs < n ? S.zs : n, ze = S.ze < n ? S.ze : n;
+    if (ze < zs) ze = zs;
+    lo = zs - 1; hi = ze;
+  }
   for (uint16_t i = 0; i < n; i++)
     if (i < lo || i >= hi) { buf[i][0] = buf[i][1] = buf[i][2] = 0; }
   const uint16_t len = hi - lo;
@@ -228,7 +252,7 @@ void renderFrame() {
 
 // Gui buf ra day, ap dung do sang + thu tu mau rieng tung doan
 void pushFrame() {
-  const uint16_t n = S.count, split = S.split;
+  const uint16_t n = S.count, split = effSplit();
   const uint16_t br = (uint16_t)S.bright + 1;
   const uint8_t *p1 = PERM[S.o1], *p2 = PERM[S.o2];
   for (uint16_t i = 0; i < n; i++) {
@@ -237,12 +261,14 @@ void pushFrame() {
     strip.setPixelColor(i, (L[P[0]] * br) >> 8, (L[P[1]] * br) >> 8, (L[P[2]] * br) >> 8);
   }
   strip.show();
+  lastPush = millis();
 }
 
 // Che do thu mau: chi sang 1 doan. raw=1: sang dung byte thu testC (dung de do thu tu)
 void pushTest() {
+  const uint16_t split = effSplit();
   for (uint16_t i = 0; i < S.count; i++) {
-    uint8_t seg = i < S.split ? 1 : 2;
+    uint8_t seg = i < split ? 1 : 2;
     uint8_t b[3] = {0, 0, 0};
     if (seg == testSeg) {
       if (testRaw) { if (testC < 3) b[testC] = 160; }
@@ -256,12 +282,27 @@ void pushTest() {
     strip.setPixelColor(i, b[0], b[1], b[2]);
   }
   strip.show();
+  lastPush = millis();
 }
 
 void applyCount() {
   strip.clear(); strip.show();               // tat het o do dai cu
+  delay(2);
   strip.updateLength(S.count);
+  if (strip.numPixels() != S.count) strip.updateLength(S.count);   // thu lai neu cap phat bo nho that bai
   memset(buf, 0, sizeof(buf));
+  resendFrames = 3;
+  dirty = true;
+}
+
+// Lam moi toan bo LED: dat lai chan data, xoa het, roi gui lai khung hinh vai lan
+void doRefresh() {
+  strip.begin();
+  strip.updateLength(S.count);
+  strip.clear(); strip.show();
+  delay(2);
+  memset(buf, 0, sizeof(buf));
+  resendFrames = 3;
   dirty = true;
 }
 
@@ -282,6 +323,7 @@ void ledTask() {
   uint32_t now = millis();
   if (countChanged) { countChanged = false; applyCount(); }
   if (powerChanged) { powerChanged = false; applyPower(); }
+  if (refreshReq)   { refreshReq = false; doRefresh(); }
 
   bool testing = testSeg && (int32_t)(testUntil - now) > 0;
   if (testSeg && !testing) { testSeg = 0; dirty = true; }
@@ -290,6 +332,7 @@ void ledTask() {
     if (dirty) { strip.clear(); strip.show(); dirty = false; }
     return;
   }
+  if (!dirty && !testing && S.mode == MODE_SOLID && now - lastPush > AUTO_REFRESH_MS) dirty = true;   // gui lai dinh ky
   if (!dirty && (testing || S.mode == MODE_SOLID)) return;   // tinh: khong can gui lai
   if (now - lastFrame < 25) return;                          // ~40 khung/giay
   uint32_t dt = now - lastFrame; lastFrame = now; if (dt > 100) dt = 100;
@@ -300,6 +343,7 @@ void ledTask() {
   renderFrame();
   pushFrame();
   dirty = false;
+  if (resendFrames) { resendFrames--; dirty = true; }       // gui them vai khung de chac chan LED nhan du
 }
 
 // ====================== WIFI / PORTAL ======================
@@ -351,9 +395,9 @@ void wifiTask() {
     uint32_t el = millis() - connStart;
     if (conn && el > 500 && WiFi.SSID() == pendSsid) {
       connState = C_OK; okAt = millis();
-      strlcpy(S.ssid, pendSsid.c_str(), sizeof(S.ssid));
-      strlcpy(S.pass, pendPass.c_str(), sizeof(S.pass));
-      saveSettings();
+      strlcpy(W.ssid, pendSsid.c_str(), sizeof(W.ssid));
+      strlcpy(W.pass, pendPass.c_str(), sizeof(W.pass));
+      saveWifi();
     } else if ((el > 1500 && (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL)) || el > 20000) {
       connState = C_FAIL; WiFi.disconnect();
     }
@@ -473,7 +517,7 @@ void handleStatus() {
 void handleCloseAp() { closeApReq = true; sendJson(F("{\"ok\":1}")); }
 
 String stateJson() {
-  String s; s.reserve(360);
+  String s; s.reserve(480);
   s += F("{\"on\":");     s += S.on;
   s += F(",\"n\":");      s += S.count;
   s += F(",\"max\":");    s += MAX_LEDS;
@@ -490,6 +534,9 @@ String stateJson() {
   s += F(",\"ze\":");     s += S.ze;
   s += F(",\"rssi\":");   s += WiFi.RSSI();
   s += F(",\"ip\":\"");   s += (WiFi.status() == WL_CONNECTED ? WiFi.localIP() : WiFi.softAPIP()).toString();
+  s += F("\",\"up\":");  s += millis() / 1000;
+  s += F(",\"heap\":");  s += ESP.getFreeHeap();
+  s += F(",\"rst\":\""); s += jsonEsc(ESP.getResetReason());
   s += F("\"}");
   return s;
 }
@@ -512,12 +559,10 @@ void handleState() { sendJson(stateJson()); }
 void handleSet() {
   long v;
   if (argL("on", 0, 1, v))          { if (S.on != v) { S.on = v; powerChanged = true; } }
-  if (argL("n", 1, MAX_LEDS, v))    { if (S.count != v) { S.count = v; countChanged = true; } }
   if (argL("bright", 1, 255, v))    S.bright = v;
   if (argL("mode", 0, MODE_COUNT - 1, v)) { if (S.mode != v) { S.mode = v; memset(buf, 0, sizeof(buf)); } }
   if (argL("speed", 1, 255, v))     S.speed = v;
   argColor("c1", S.c1); argColor("c2", S.c2);
-  if (argL("split", 1, MAX_LEDS, v)) S.split = v;
   if (argL("o1", 0, 5, v))          S.o1 = v;
   if (argL("o2", 0, 5, v))          S.o2 = v;
   if (argL("zon", 0, 1, v))         S.zoneOn = v;
@@ -527,6 +572,21 @@ void handleSet() {
   dirty = true; saveAt = millis() + 1500;
   sendJson(stateJson());
 }
+
+// Ap dung so LED + diem chia 2 doan cung luc (nut "Ap dung" tren web)
+void handleApply() {
+  long n = S.count, sp = S.split;
+  argL("n", 1, MAX_LEDS, n);
+  argL("split", 1, MAX_LEDS, sp);
+  if (sp > n) sp = n;
+  if (S.count != n) { S.count = n; countChanged = true; }
+  S.split = sp;
+  sanitize();
+  resendFrames = 3; dirty = true; saveAt = millis() + 500;
+  sendJson(stateJson());
+}
+
+void handleRefresh() { refreshReq = true; sendJson(F("{\"ok\":1}")); }
 
 void handleTest() {
   long seg = 0, c = 255, raw = 0;
@@ -550,7 +610,7 @@ void handleDeepSleep() {
 }
 
 void handleForget() {
-  S.ssid[0] = 0; S.pass[0] = 0; saveSettings();
+  W.ssid[0] = 0; W.pass[0] = 0; saveWifi();
   sendJson(F("{\"ok\":1}")); delay(300); ESP.restart();
 }
 void handleRestart() { sendJson(F("{\"ok\":1}")); delay(300); ESP.restart(); }
@@ -567,7 +627,7 @@ void setup() {
   Serial.begin(115200);
   randomSeed(analogRead(A0) ^ micros());
   WiFi.persistent(false);
-  EEPROM.begin(sizeof(Settings));
+  EEPROM.begin(LED_EEPROM_OFF + sizeof(Settings));
   loadSettings();
 
   if (LED_POWER_PIN >= 0) {
@@ -585,12 +645,12 @@ void setup() {
   WiFi.hostname(HOSTNAME);
   Serial.printf("\nLED Controller | MAC=%s | hostname=%s | LED=%u | on=%u\n",
                 WiFi.macAddress().c_str(), HOSTNAME, (unsigned)S.count, (unsigned)S.on);
-  if (S.ssid[0]) { WiFi.begin(S.ssid, S.pass); bootConn = true; bootStart = millis(); }
+  if (W.ssid[0]) { WiFi.begin(W.ssid, W.pass); bootConn = true; bootStart = millis(); }
   else startPortal();
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/app", HTTP_GET, []() { server.send_P(200, "text/html; charset=utf-8", PAGE_APP); });
-  server.on("/glass.css", HTTP_GET, []() {
+  server.on("/ui.css", HTTP_GET, []() {
     server.sendHeader("Cache-Control", "max-age=86400");
     server.send_P(200, "text/css; charset=utf-8", PAGE_CSS);
   });
@@ -600,6 +660,8 @@ void setup() {
   server.on("/closeap", HTTP_POST, handleCloseAp);
   server.on("/api/state", HTTP_GET, handleState);
   server.on("/api/set", HTTP_POST, handleSet);
+  server.on("/api/apply", HTTP_POST, handleApply);
+  server.on("/api/refresh", HTTP_POST, handleRefresh);
   server.on("/api/test", HTTP_POST, handleTest);
   server.on("/api/deepsleep", HTTP_POST, handleDeepSleep);
   server.on("/api/forget", HTTP_POST, handleForget);
