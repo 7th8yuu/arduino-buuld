@@ -49,7 +49,7 @@ jobs:
             echo "### Ket qua build"
             echo
             echo '```'
-            grep -E "Sketch uses|Global variables" build/compile.log || true
+            grep -E "Variables and constants|Instruction RAM|Code in flash" build/compile.log || true
             echo '```'
             echo
             ls -l build/*.bin | awk '{print "- " $9 " (" $5 " byte)"}'

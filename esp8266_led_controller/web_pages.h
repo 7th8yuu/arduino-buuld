@@ -11,6 +11,7 @@
 static const char PAGE_CSS[] PROGMEM =
   "\n"
   ":root{--txt:#f5f8ff;--mut:rgba(245,248,255,.64);--st:rgba(255,255,255,.32);--acc:#8ff3ff}\n"
+  "[hidden]{display:none!important}\n"
   "*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}\n"
   "html{background:#060a16}\n"
   "body{margin:0;min-height:100vh;color:var(--txt);font:15px/1.45 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;padding:16px 14px 44px}\n"
