@@ -1,0 +1,66 @@
+name: Build ESP8266 firmware
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ESP8266_CORE: "3.1.2"                 # cung ban core voi ArduinoDroid cua ban
+  FQBN: "esp8266:esp8266:nodemcuv2"     # NodeMCU 1.0 (ESP-12E); doi neu dung board khac
+  SKETCH: esp8266_led_controller        # ten thu muc sketch (phai trung ten file .ino)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cai arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Cai core ESP8266 va thu vien
+        shell: bash
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+          arduino-cli core update-index
+          arduino-cli core install "esp8266:esp8266@${ESP8266_CORE}"
+          arduino-cli lib install "Adafruit NeoPixel"
+          arduino-cli lib list
+
+      - name: Bien dich
+        shell: bash          # bash co pipefail: loi bien dich se lam step that bai
+        run: |
+          mkdir -p build
+          arduino-cli compile \
+            --fqbn "${FQBN}" \
+            --warnings all \
+            --output-dir build \
+            "${SKETCH}" 2>&1 | tee build/compile.log
+
+      - name: Tom tat dung luong
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "### Ket qua build"
+            echo
+            echo '```'
+            grep -E "Sketch uses|Global variables" build/compile.log || true
+            echo '```'
+            echo
+            ls -l build/*.bin | awk '{print "- " $9 " (" $5 " byte)"}'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Luu file firmware
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp8266-led-firmware
+          path: |
+            build/*.bin
+            build/compile.log
+          if-no-files-found: error
