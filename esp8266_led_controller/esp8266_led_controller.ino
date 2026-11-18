@@ -56,7 +56,8 @@ enum { MODE_SOLID, MODE_BREATHE, MODE_RAINBOW, MODE_SPREAD, MODE_THEATER,
        MODE_SHIMMER, MODE_FIRE, MODE_CANDLE, MODE_WAVE, MODE_RAIN, MODE_FADE,
        MODE_STORM, MODE_POLICE, MODE_FIREWORK, MODE_AURORA, MODE_RGLITTER,
        MODE_RCHASE, MODE_HEART, MODE_WIPE, MODE_PLASMA, MODE_DISCO, MODE_DUAL,
-       MODE_FIREFLY, MODE_COUNT };
+       MODE_FIREFLY, MODE_BOUNCE, MODE_OCEAN, MODE_RIPPLE, MODE_TRAIN, MODE_SUNSET,
+       MODE_SEGS, MODE_COUNT };
 
 // Thu tu byte gui ra day: PERM[order][k] = kenh logic (0=R,1=G,2=B) nam o byte thu k
 // 0 RGB, 1 RBG, 2 GRB, 3 GBR, 4 BRG, 5 BGR
@@ -253,6 +254,10 @@ static Spark sparks[SPARKS_MAX];
 static Drop  drops[DROPS_MAX];
 static Burst bursts[FW_MAX];
 static uint8_t heat[MAX_LEDS];                                      // lua / nen
+#define BALLS 3
+struct Ball  { int32_t pos, vel; bool init; };                     // pos, vel: x256 don vi LED
+static Ball  balls[BALLS];
+static const uint8_t SUN[5][3] = {{70,0,130},{255,0,90},{255,90,0},{255,190,30},{70,0,130}};   // bang mau hoang hon (khep vong)
 static uint8_t stormFlashes = 0, stormGap = 0;
 static uint16_t stormPos = 0, stormLen = 0;
 
@@ -262,6 +267,7 @@ static void resetFx() {
   memset(drops, 0, sizeof(drops));
   memset(bursts, 0, sizeof(bursts));
   memset(heat, 0, sizeof(heat));
+  memset(balls, 0, sizeof(balls));
   stormFlashes = 0; stormGap = 0;
 }
 
@@ -563,6 +569,82 @@ void renderFrame() {
         if (d1 < tail) { scaleC(S.c1, 255 - (uint32_t)d1 * 255 / tail, c); maxPx(lo + k, c); }
         if (d2 < tail) { scaleC(S.c2, 255 - (uint32_t)d2 * 255 / tail, c); maxPx(lo + k, c); }
       }
+    } break;
+
+    case MODE_BOUNCE: {                                // 3 qua bong nay tren day: mau 1, mau 2, va mau tron
+      const uint8_t blk[3] = {0, 0, 0};
+      uint8_t mid[3]; mixC(S.c1, S.c2, 128, mid);
+      const uint8_t* bc[BALLS] = {S.c1, S.c2, mid};
+      fadeToBg(lo, hi, blk, 1);
+      int32_t H = ((int32_t)len - 1) * 256; if (H < 256) H = 256;
+      for (uint8_t b = 0; b < BALLS; b++) {
+        Ball& bl = balls[b];
+        int32_t T = (90 - S.speed / 4) * (100 - 14 * b) / 100;     // so khung bay len toi dinh: nhanh khi toc do cao
+        if (T < 12) T = 12;
+        int32_t g = 2 * H / (T * T); if (g < 1) g = 1;              // trong luc, de bong cham dung dinh day
+        if (!bl.init) { bl.init = true; bl.pos = 0; bl.vel = g * T; }
+        bl.vel -= g; bl.pos += bl.vel;
+        if (bl.pos <= 0) {
+          bl.pos = 0;
+          bl.vel = -bl.vel * 7 / 8;                                 // nay lai, mat bot nang luong
+          if (bl.vel < g * 4) bl.vel = g * T;                       // nay het da -> tha lai tu dau
+        }
+        if (bl.pos > H) { bl.pos = H; if (bl.vel > 0) bl.vel = 0; }
+        uint16_t idx = lo + (uint16_t)((bl.pos + 128) >> 8);
+        if (idx >= hi) idx = hi - 1;
+        maxPx(idx, bc[b]);
+      }
+    } break;
+
+    case MODE_OCEAN:                                   // dai duong: xanh la - xanh bien, song sang toi chay cham
+      for (uint16_t i = lo; i < hi; i++) {
+        int x = i - lo;
+        uint8_t a  = sin8((uint8_t)(x * 4 + ph8));
+        uint8_t b2 = sin8((uint8_t)(x * 7 - ph8 * 2));
+        wheel(105 + (((uint16_t)a * 65) >> 8), c);
+        scaleC(c, 80 + (((uint16_t)b2 * 175) >> 8), c);
+        setPx(i, c);
+      }
+      break;
+
+    case MODE_RIPPLE: {                                // gon song lan toa tu giua day ra hai dau
+      uint8_t rb[3]; scaleC(S.c2, 30, rb);
+      int center = lo + len / 2;
+      for (uint16_t i = lo; i < hi; i++) {
+        int d = (int)i - center; if (d < 0) d = -d;
+        uint8_t v = sin8((uint8_t)(d * 8 - ph8));
+        v = ((uint16_t)v * v) >> 8; v = ((uint16_t)v * v) >> 8;   // mong dinh song
+        mixC(rb, S.c1, v, c);
+        setPx(i, c);
+      }
+    } break;
+
+    case MODE_TRAIN: {                                 // doan tau: moi 24 LED co 1 toa 6 LED (than mau 1, dau mau 2)
+      const uint8_t blk[3] = {0, 0, 0};
+      uint16_t sh = ((uint32_t)ph * 24) >> 16;         // 0..23
+      for (uint16_t i = lo; i < hi; i++) {
+        uint16_t r = ((i - lo) + 24 - sh) % 24;
+        if (r == 5)      setPx(i, S.c2);
+        else if (r < 5)  setPx(i, S.c1);
+        else             setPx(i, blk);
+      }
+    } break;
+
+    case MODE_SUNSET:                                  // hoang hon: tim - hong - cam - vang truot nhe theo day
+      for (uint16_t i = lo; i < hi; i++) {
+        uint8_t t = (uint8_t)(((uint32_t)(i - lo) * 256 / len) + ph8);
+        mixC(SUN[t >> 6], SUN[(t >> 6) + 1], (t & 63) * 4, c);
+        setPx(i, c);
+      }
+      break;
+
+    case MODE_SEGS: {                                  // doan 1 mau 1, doan 2 mau 2, tho luan phien nhau
+      uint16_t sp = effSplit();
+      uint8_t v1 = smooth8(tri8(ph8)), v2 = 255 - v1;
+      uint8_t a[3], b[3];
+      scaleC(S.c1, 40 + (((uint16_t)v1 * 215) >> 8), a);
+      scaleC(S.c2, 40 + (((uint16_t)v2 * 215) >> 8), b);
+      for (uint16_t i = lo; i < hi; i++) setPx(i, i < sp ? a : b);
     } break;
 
     case MODE_HEART: {                                 // nhip tim: hai nhip thinh thich roi nghi
