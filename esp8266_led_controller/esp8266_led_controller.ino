@@ -50,8 +50,13 @@
 #define CAL_EEPROM_OFF 192        // can chinh mau luu rieng tu byte 192 (khong dung chung vung cai dat LED)
 #define CMAGIC 0x43414C31UL       // "CAL1"
 
+// Thu tu phai khop MODES[] trong web_pages.h. Chi them o cuoi de so mode da luu khong bi lech.
 enum { MODE_SOLID, MODE_BREATHE, MODE_RAINBOW, MODE_SPREAD, MODE_THEATER,
-       MODE_COMET, MODE_TWINKLE, MODE_SCANNER, MODE_GRADIENT, MODE_COUNT };
+       MODE_COMET, MODE_TWINKLE, MODE_SCANNER, MODE_GRADIENT,
+       MODE_SHIMMER, MODE_FIRE, MODE_CANDLE, MODE_WAVE, MODE_RAIN, MODE_FADE,
+       MODE_STORM, MODE_POLICE, MODE_FIREWORK, MODE_AURORA, MODE_RGLITTER,
+       MODE_RCHASE, MODE_HEART, MODE_WIPE, MODE_PLASMA, MODE_DISCO, MODE_DUAL,
+       MODE_FIREFLY, MODE_COUNT };
 
 // Thu tu byte gui ra day: PERM[order][k] = kenh logic (0=R,1=G,2=B) nam o byte thu k
 // 0 RGB, 1 RBG, 2 GRB, 3 GBR, 4 BRG, 5 BGR
@@ -192,6 +197,74 @@ static void fadeToBg(uint16_t lo, uint16_t hi, const uint8_t* bg, uint8_t shift)
     }
 }
 
+// ---- bang sin 8 bit (0..255 tuong ung 0..2*PI), tranh dung sinf() cho nhe CPU ----
+static const uint8_t SIN8[256] = {
+  128,131,134,137,140,143,146,149,152,155,158,162,165,167,170,173,
+  176,179,182,185,188,190,193,196,198,201,203,206,208,211,213,215,
+  218,220,222,224,226,228,230,232,234,235,237,238,240,241,243,244,
+  245,246,248,249,250,250,251,252,253,253,254,254,254,255,255,255,
+  255,255,255,255,254,254,254,253,253,252,251,250,250,249,248,246,
+  245,244,243,241,240,238,237,235,234,232,230,228,226,224,222,220,
+  218,215,213,211,208,206,203,201,198,196,193,190,188,185,182,179,
+  176,173,170,167,165,162,158,155,152,149,146,143,140,137,134,131,
+  128,124,121,118,115,112,109,106,103,100, 97, 93, 90, 88, 85, 82,
+   79, 76, 73, 70, 67, 65, 62, 59, 57, 54, 52, 49, 47, 44, 42, 40,
+   37, 35, 33, 31, 29, 27, 25, 23, 21, 20, 18, 17, 15, 14, 12, 11,
+   10,  9,  7,  6,  5,  5,  4,  3,  2,  2,  1,  1,  1,  0,  0,  0,
+    0,  0,  0,  0,  1,  1,  1,  2,  2,  3,  4,  5,  5,  6,  7,  9,
+   10, 11, 12, 14, 15, 17, 18, 20, 21, 23, 25, 27, 29, 31, 33, 35,
+   37, 40, 42, 44, 47, 49, 52, 54, 57, 59, 62, 65, 67, 70, 73, 76,
+   79, 82, 85, 88, 90, 93, 97,100,103,106,109,112,115,118,121,124
+};
+static inline uint8_t sin8(uint8_t x) { return SIN8[x]; }
+static inline uint8_t smooth8(uint8_t t) { return ((uint32_t)t * t * (765 - 2 * (uint32_t)t)) / 65025UL; }   // smoothstep 0..255
+static inline uint8_t hash8(uint16_t i, uint16_t s) {
+  uint32_t h = ((uint32_t)i * 2654435761UL) ^ ((uint32_t)s * 40503UL);
+  h ^= h >> 15; h *= 2246822519UL; h ^= h >> 13;
+  return h >> 24;
+}
+// nhiet do 0..255 -> mau lua (den, do, cam, vang, trang)
+static void heatColor(uint8_t h, uint8_t* c) {
+  uint8_t t192 = ((uint16_t)h * 191) >> 8;
+  uint8_t ramp = (t192 & 0x3F) << 2;
+  if (t192 & 0x80)      { c[0] = 255;  c[1] = 255;  c[2] = ramp; }
+  else if (t192 & 0x40) { c[0] = 255;  c[1] = ramp; c[2] = 0; }
+  else                  { c[0] = ramp; c[1] = 0;    c[2] = 0; }
+}
+static inline uint8_t qsub8(uint8_t a, uint8_t b) { return a > b ? a - b : 0; }
+static inline uint8_t qadd8(uint8_t a, uint8_t b) { uint16_t s = a + b; return s > 255 ? 255 : s; }
+// tron a -> b theo t (0..255)
+static void mixC(const uint8_t* a, const uint8_t* b, uint8_t t, uint8_t* o) {
+  for (uint8_t k = 0; k < 3; k++) o[k] = a[k] + (((int)b[k] - (int)a[k]) * t) / 255;
+}
+// lay gia tri lon hon theo tung kenh (de cac diem sang chong len nen ma khong lam toi nen)
+static void maxPx(uint16_t i, const uint8_t* c) {
+  for (uint8_t k = 0; k < 3; k++) if (c[k] > buf[i][k]) buf[i][k] = c[k];
+}
+
+// ---- trang thai cua cac hieu ung co "bo nho" (xoa khi doi mode) ----
+#define SPARKS_MAX 24
+#define DROPS_MAX  12
+#define FW_MAX     3
+struct Spark { uint16_t pos; uint8_t age, life; };                 // life = 0: o trong
+struct Drop  { uint16_t pos16; uint8_t spd; bool on; };            // pos16: vi tri x16, spd: do dai buoc moi khung (x16)
+struct Burst { uint16_t pos; uint8_t r, rmax, hue; bool on; };
+static Spark sparks[SPARKS_MAX];
+static Drop  drops[DROPS_MAX];
+static Burst bursts[FW_MAX];
+static uint8_t heat[MAX_LEDS];                                      // lua / nen
+static uint8_t stormFlashes = 0, stormGap = 0;
+static uint16_t stormPos = 0, stormLen = 0;
+
+static void resetFx() {
+  memset(buf, 0, sizeof(buf));
+  memset(sparks, 0, sizeof(sparks));
+  memset(drops, 0, sizeof(drops));
+  memset(bursts, 0, sizeof(bursts));
+  memset(heat, 0, sizeof(heat));
+  stormFlashes = 0; stormGap = 0;
+}
+
 void renderFrame() {
   const uint16_t n = S.count;
   uint16_t lo = 0, hi = n;
@@ -240,11 +313,40 @@ void renderFrame() {
         else setPx(lo + k, bg);
       }
     } break;
-    case MODE_TWINKLE: {
-      fadeToBg(lo, hi, bg, 3);
-      uint8_t chance = 15 + S.speed / 4;
-      for (uint16_t s = 0; s < 1 + len / 50; s++)
-        if (random(100) < chance) setPx(lo + (uint16_t)random(len), S.c1);
+    case MODE_TWINKLE:
+    case MODE_FIREFLY: {
+      // Nen tat. Moi diem sang la dung 1 LED (mau 1), nhieu LED lech nhau.
+      // Lap lanh: bat nhanh roi tat dan, day dac. Dom dom: it hon, len/tat cham va mem.
+      const bool fly = (S.mode == MODE_FIREFLY);
+      static const uint8_t zero3[3] = {0, 0, 0};
+      for (uint16_t i = lo; i < hi; i++) setPx(i, zero3);
+      uint8_t maxActive = fly ? 1 + len / 14 : 2 + len / 6;
+      if (maxActive > SPARKS_MAX) maxActive = SPARKS_MAX;
+      uint8_t active = 0;
+      for (uint8_t s = 0; s < SPARKS_MAX; s++) if (sparks[s].life) active++;
+      if (active < maxActive && random(100) < (fly ? 6 + S.speed / 16 : 25 + S.speed / 3)) {
+        for (uint8_t s = 0; s < SPARKS_MAX; s++) if (!sparks[s].life) {
+          sparks[s].pos  = lo + random(len);
+          sparks[s].age  = 0;
+          sparks[s].life = fly ? 50 + random(60) + (255 - S.speed) / 3       // 50..194 khung (~2..8 giay)
+                               : 12 + random(20) + (255 - S.speed) / 10;     // 12..57 khung (~0.5..2.3 giay)
+          break;
+        }
+      }
+      for (uint8_t s = 0; s < SPARKS_MAX; s++) {
+        Spark& sp = sparks[s];
+        if (!sp.life) continue;
+        if (++sp.age >= sp.life) { sp.life = 0; continue; }
+        uint8_t atk = sp.life / 4;                                     // lap lanh: 1/4 dau bat len, 3/4 sau tat dan
+        uint8_t env;
+        if (fly) env = smooth8(tri8((uint16_t)sp.age * 255 / sp.life));   // dom dom: len va tat doi xung, mem
+        else     env = sp.age < atk ? (uint16_t)sp.age * 255 / atk
+                                    : (uint16_t)(sp.life - sp.age) * 255 / (sp.life - atk);
+        if (sp.pos >= lo && sp.pos < hi) {
+          scaleC(S.c1, env, c);
+          maxPx(sp.pos, c);
+        }
+      }
     } break;
     case MODE_SCANNER: {
       static int32_t lastPos = -1;
@@ -262,6 +364,215 @@ void renderFrame() {
         setPx(i, c);
       }
       break;
+
+    case MODE_SHIMMER: {                               // ca day sang nhe, tung LED long lanh lech pha
+      uint8_t sb[3], sh[3];
+      scaleC(S.c2, 56, sb); scaleC(S.c1, 210, sh);
+      for (uint16_t i = lo; i < hi; i++) {
+        uint8_t v = ((uint16_t)sin8(ph8 + hash8(i, 1)) + sin8((uint8_t)(ph8 * 2) + hash8(i, 2))) >> 1;
+        mixC(sb, sh, v, c);
+        setPx(i, c);
+      }
+    } break;
+
+    case MODE_FIRE: {                                  // lua: nong o dau day (LED 1), bay len cuoi day
+      uint16_t coolMax = 550 / len + 2; if (coolMax > 60) coolMax = 60;
+      for (uint16_t i = 0; i < len; i++) heat[i] = qsub8(heat[i], random(0, coolMax));
+      for (int32_t k = (int32_t)len - 1; k >= 2; k--) heat[k] = ((uint16_t)heat[k - 1] + heat[k - 2] + heat[k - 2]) / 3;
+      if (random(255) < 70 + S.speed / 2) {
+        uint16_t y = random(len < 7 ? len : 7);
+        heat[y] = qadd8(heat[y], 160 + random(95));
+      }
+      for (uint16_t i = 0; i < len; i++) { heatColor(heat[i], c); setPx(lo + i, c); }
+    } break;
+
+    case MODE_CANDLE: {                                // nen: chap chon chung, mau 1
+      uint8_t g = 110 + random(146);                   // chap chon chung ca day
+      for (uint16_t i = 0; i < len; i++) {
+        uint8_t own = 80 + random(176);
+        uint8_t tgt = ((uint16_t)g * 3 + own) >> 2;
+        heat[i] = heat[i] + ((int)tgt - (int)heat[i]) / 3;
+        scaleC(S.c1, heat[i], c);
+        setPx(lo + i, c);
+      }
+    } break;
+
+    case MODE_WAVE: {                                  // song sang chay doc day
+      uint8_t wb[3]; scaleC(S.c2, 40, wb);
+      for (uint16_t i = lo; i < hi; i++) {
+        uint8_t v = sin8((uint8_t)((i - lo) * 6 + ph8));
+        v = ((uint16_t)v * v) >> 8;                    // nhon dinh song
+        mixC(wb, S.c1, v, c);
+        setPx(i, c);
+      }
+    } break;
+
+    case MODE_RAIN: {                                  // nhieu giot sang chay tu LED dau den LED cuoi
+      fadeToBg(lo, hi, bg, 2);
+      if (random(100) < 4 + S.speed / 16) {
+        for (uint8_t s = 0; s < DROPS_MAX; s++) if (!drops[s].on) {
+          drops[s].on = true; drops[s].pos16 = 0; drops[s].spd = 10 + random(14) + S.speed / 12;
+          break;
+        }
+      }
+      for (uint8_t s = 0; s < DROPS_MAX; s++) {
+        Drop& d = drops[s];
+        if (!d.on) continue;
+        uint16_t oldp = d.pos16 >> 4;
+        d.pos16 += d.spd;
+        uint16_t newp = d.pos16 >> 4;
+        for (uint16_t k = oldp; k <= newp && k < len; k++) setPx(lo + k, S.c1);
+        if (newp >= len) d.on = false;
+      }
+    } break;
+
+    case MODE_FADE:                                    // doi mau muot giua mau 1 va mau 2
+      mixC(S.c1, S.c2, smooth8(tri8(ph8)), c);
+      for (uint16_t i = lo; i < hi; i++) setPx(i, c);
+      break;
+
+    case MODE_STORM: {                                 // bao: nen toi (mau 2), thinh thoang chop sang mot doan (mau 1)
+      uint8_t sb[3]; scaleC(S.c2, 30, sb);
+      fadeToBg(lo, hi, sb, 2);
+      if (stormFlashes) {
+        if (stormGap) stormGap--;
+        else {
+          for (uint16_t k = stormPos; k < stormPos + stormLen && k < len; k++) setPx(lo + k, S.c1);
+          stormFlashes--; stormGap = 2 + random(5);
+        }
+      } else if (random(1000) < 8 + S.speed / 8) {
+        stormFlashes = 1 + random(3);
+        stormGap = 0;
+        stormLen = len / 3 + random(len / 2 + 1);
+        if (stormLen > len) stormLen = len;
+        if (stormLen < 1) stormLen = 1;
+        stormPos = random(len - stormLen + 1);
+      }
+    } break;
+
+    case MODE_POLICE: {                                // nua dau nhay mau 1, nua sau nhay mau 2, luan phien
+      const uint8_t blk[3] = {0, 0, 0};
+      uint8_t step = ph >> 12;                         // 0..15
+      bool a = (step == 0 || step == 2), b = (step == 8 || step == 10);
+      uint16_t mid = lo + len / 2;
+      for (uint16_t i = lo; i < hi; i++) {
+        if (i < mid) setPx(i, a ? S.c1 : blk);
+        else         setPx(i, b ? S.c2 : blk);
+      }
+    } break;
+
+    case MODE_FIREWORK: {                              // phao hoa: no vong sang mau ngau nhien roi tat dan
+      const uint8_t dark[3] = {0, 0, 0}, wht[3] = {255, 255, 255};
+      fadeToBg(lo, hi, dark, 2);
+      if (random(100) < 3 + S.speed / 20) {
+        for (uint8_t s = 0; s < FW_MAX; s++) if (!bursts[s].on) {
+          Burst& b = bursts[s];
+          b.on = true; b.r = 0; b.hue = random(256);
+          b.pos = lo + random(len);
+          b.rmax = 5 + random(10); if (b.rmax > len / 2) b.rmax = len / 2;
+          break;
+        }
+      }
+      for (uint8_t s = 0; s < FW_MAX; s++) {
+        Burst& b = bursts[s];
+        if (!b.on) continue;
+        if (b.r == 0) { if (b.pos >= lo && b.pos < hi) setPx(b.pos, wht); }
+        else {
+          wheel(b.hue, c);
+          int l = (int)b.pos - b.r, r = (int)b.pos + b.r;
+          if (l >= (int)lo && l < (int)hi) setPx(l, c);
+          if (r >= (int)lo && r < (int)hi) setPx(r, c);
+        }
+        if (++b.r > b.rmax) b.on = false;
+      }
+    } break;
+
+    case MODE_AURORA:                                  // cuc quang: hai lop song cham nguoc chieu, tron mau 1 - mau 2
+      for (uint16_t i = lo; i < hi; i++) {
+        uint8_t t1 = sin8((uint8_t)((i - lo) * 6 + ph8));
+        uint8_t t2 = sin8((uint8_t)((i - lo) * 4 - ph8));
+        mixC(S.c1, S.c2, t1, c);
+        scaleC(c, 70 + (((uint16_t)t2 * 185) >> 8), c);
+        setPx(i, c);
+      }
+      break;
+
+    case MODE_RGLITTER: {                              // cau vong dim + vai diem sao trang nhe
+      for (uint16_t i = lo; i < hi; i++) {
+        wheel((uint8_t)(((uint32_t)(i - lo) * 256 / len) + ph8), c);
+        scaleC(c, 150, c);
+        setPx(i, c);
+      }
+      const uint8_t w1[3] = {230, 230, 230}, w2[3] = {110, 110, 110};
+      for (uint16_t s = 0; s < 1 + len / 60u; s++) {
+        if (random(100) >= 30 + S.speed / 3) continue;
+        int p = lo + random(len);
+        maxPx(p, w1);
+        if (p - 1 >= (int)lo) maxPx(p - 1, w2);
+        if (p + 1 < (int)hi)  maxPx(p + 1, w2);
+      }
+    } break;
+
+    case MODE_RCHASE: {                                // cau vong chay theo kieu den rap hat (cu 3 LED sang 1)
+      const uint8_t blk[3] = {0, 0, 0};
+      uint8_t sh = ((uint32_t)ph * 12) >> 16;          // 0..11
+      for (uint16_t i = lo; i < hi; i++) {
+        if (((i - lo) + sh) % 3 == 0) {
+          wheel((uint8_t)(((uint32_t)(i - lo) * 256 / len) + ph8), c);
+          setPx(i, c);
+        } else setPx(i, blk);
+      }
+    } break;
+
+    case MODE_WIPE: {                                  // phu mau: mau 1 phu dan len mau 2, roi mau 2 phu lai
+      uint16_t p = ((uint32_t)ph * 2 * len) >> 16;     // 0 .. 2*len-1
+      bool second = p >= len;
+      uint16_t cut = second ? p - len : p;
+      const uint8_t* a = second ? S.c2 : S.c1;         // mau dang phu len
+      const uint8_t* b = second ? S.c1 : S.c2;         // mau cu
+      for (uint16_t i = lo; i < hi; i++) setPx(i, (i - lo) < cut ? a : b);
+    } break;
+
+    case MODE_PLASMA:                                  // plasma: ba lop song cong lai thanh mau chay muot
+      for (uint16_t i = lo; i < hi; i++) {
+        int x = i - lo;
+        uint16_t sum = sin8((uint8_t)(x * 5 + ph8)) + sin8((uint8_t)(x * 3 - ph8 * 2)) + sin8((uint8_t)(x * 2 + ph8 * 3));
+        wheel((uint8_t)(sum / 3 * 2 + ph8), c);
+        setPx(i, c);
+      }
+      break;
+
+    case MODE_DISCO: {                                 // moi buoc moi LED doi mau ngau nhien (hoac tat)
+      const uint8_t blk[3] = {0, 0, 0};
+      uint8_t step = ph >> 12;                         // 0..15
+      for (uint16_t i = lo; i < hi; i++) {
+        if (hash8(i, step + 99) > 90) { wheel(hash8(i, step), c); setPx(i, c); }
+        else setPx(i, blk);
+      }
+    } break;
+
+    case MODE_DUAL: {                                  // hai sao bang chay nguoc chieu: mau 1 xuoi, mau 2 nguoc
+      const uint8_t blk[3] = {0, 0, 0};
+      uint16_t tail = len / 5; if (tail < 4) tail = 4; if (tail > len) tail = len;
+      uint16_t head1 = ((uint32_t)ph * len) >> 16;
+      uint16_t head2 = len - 1 - head1;
+      for (uint16_t k = 0; k < len; k++) {
+        setPx(lo + k, blk);
+        uint16_t d1 = (head1 + len - k) % len;         // dang sau sao bang 1 (chay len)
+        uint16_t d2 = (k + len - head2) % len;         // dang sau sao bang 2 (chay xuong)
+        if (d1 < tail) { scaleC(S.c1, 255 - (uint32_t)d1 * 255 / tail, c); maxPx(lo + k, c); }
+        if (d2 < tail) { scaleC(S.c2, 255 - (uint32_t)d2 * 255 / tail, c); maxPx(lo + k, c); }
+      }
+    } break;
+
+    case MODE_HEART: {                                 // nhip tim: hai nhip thinh thich roi nghi
+      uint8_t hb[3]; scaleC(S.c2, 25, hb);
+      uint8_t u = ph8, lvl = 0;
+      if (u < 48)                  lvl = tri8((uint16_t)u * 255 / 47);
+      else if (u >= 64 && u < 128) lvl = ((uint16_t)tri8((uint16_t)(u - 64) * 255 / 63) * 180) >> 8;
+      mixC(hb, S.c1, lvl, c);
+      for (uint16_t i = lo; i < hi; i++) setPx(i, c);
+    } break;
   }
 }
 
@@ -576,7 +887,7 @@ void handleSet() {
   long v;
   if (argL("on", 0, 1, v))          { if (S.on != v) { S.on = v; powerChanged = true; } }
   if (argL("bright", 1, 255, v))    S.bright = v;
-  if (argL("mode", 0, MODE_COUNT - 1, v)) { if (S.mode != v) { S.mode = v; memset(buf, 0, sizeof(buf)); } }
+  if (argL("mode", 0, MODE_COUNT - 1, v)) { if (S.mode != v) { S.mode = v; resetFx(); } }
   if (argL("speed", 1, 255, v))     S.speed = v;
   argColor("c1", S.c1); argColor("c2", S.c2);
   bool calSet = server.hasArg("g1") || server.hasArg("g2");     // can chinh mau: hex RRGGBB, ff = 100%
