@@ -14,10 +14,9 @@
            GND cua 2 nguon + GND ESP phai noi chung. Cat day +5V o cho noi giua 2 doan
            (giu nguyen GND va DATA) de 2 nguon khong day nguoc vao nhau.
 
-  Den bao trang thai (LED xanh tren module ESP, GPIO2):
-    nhay cham (0.6 s)      = dang tim/noi WiFi nha
-    nhay nhanh (0.15 s)    = dang phat WiFi "LED-Setup" (AP)
-    nhay ngan moi 3 giay   = da vao WiFi nha, binh thuong
+  Can chinh mau (can bang trang) rieng tung doan: tab "Day LED", moi doan co 3 thanh R/G/B (10%..100%).
+    Bam "Trang" o doan do roi ha kenh mau bi lo cho toi khi trang deu giua 2 doan. 100% = khong chinh.
+    Luu o vung EEPROM rieng (CAL_EEPROM_OFF), khong lam mat WiFi va cai dat da luu.
   Nut FLASH (GPIO0) tren NodeMCU: giu 2 giay = mo AP "LED-Setup" va GIU MO (khong tu dong dong).
     Noi dien thoai vao "LED-Setup" roi mo http://192.168.4.1 de dieu khien truc tiep, khong
     can qua router. Giu 2 giay lan nua = dong AP.
@@ -40,7 +39,6 @@
 #define AP_PASS        "12345678" // >= 8 ky tu; de "" neu muon AP mo
 #define HOSTNAME       "ledctl"   // truy cap http://ledctl.local
 #define AP_CLOSE_MS    60000UL    // AP tu dong sau khi ket noi thanh cong
-#define STATUS_LED     2          // LED xanh tren module ESP-12 (GPIO2, sang khi muc LOW); -1 = khong dung
 #define BTN_PIN        0          // nut FLASH tren NodeMCU (GPIO0); -1 = khong dung
 #define BTN_HOLD_MS    2000UL     // giu nut lau hon the nay thi mo/dong AP "LED-Setup"
 #define AUTO_REFRESH_MS 4000UL    // gui lai khung tinh moi 4 giay: LED bi reset do sut nguon se tu sang lai
@@ -49,6 +47,8 @@
 #define WMAGIC 0x4C454433UL       // vung WiFi (giu nguyen ma cu de khong mat WiFi da luu)
 #define LMAGIC 0x4C454435UL       // vung cai dat LED
 #define LED_EEPROM_OFF 128        // cai dat LED luu tu byte 128, WiFi o byte 0
+#define CAL_EEPROM_OFF 192        // can chinh mau luu rieng tu byte 192 (khong dung chung vung cai dat LED)
+#define CMAGIC 0x43414C31UL       // "CAL1"
 
 enum { MODE_SOLID, MODE_BREATHE, MODE_RAINBOW, MODE_SPREAD, MODE_THEATER,
        MODE_COMET, MODE_TWINKLE, MODE_SCANNER, MODE_GRADIENT, MODE_COUNT };
@@ -69,8 +69,15 @@ struct Settings {                     // EEPROM byte LED_EEPROM_OFF
   uint8_t  o1, o2, zoneOn, pad;
   uint16_t count, split, zs, ze;
 };
+struct Calib {                        // EEPROM byte CAL_EEPROM_OFF
+  uint32_t magic;
+  uint8_t  g[2][3];                   // he so mau [doan 1/2][R,G,B], 255 = 100% (khong chinh)
+  uint8_t  pad[2];
+};
+static_assert(LED_EEPROM_OFF + sizeof(Settings) <= CAL_EEPROM_OFF, "Settings de len vung can chinh mau");
 WifiCfg  W;
 Settings S;
+Calib    CL;
 
 Adafruit_NeoPixel strip(MAX_LEDS, LED_PIN, NEO_RGB + NEO_KHZ800);
 ESP8266WebServer  server(80);
@@ -127,6 +134,12 @@ void defaults() {
   S.zs = 1; S.ze = 10;
 }
 
+void defaultsCal() {
+  memset(&CL, 0, sizeof(CL));
+  CL.magic = CMAGIC;
+  memset(CL.g, 255, sizeof(CL.g));             // 100% moi kenh = giu nguyen nhu cu
+}
+
 void sanitize() {
   S.count = clampL(S.count, 1, MAX_LEDS);
   S.split = clampL(S.split, 1, MAX_LEDS);      // giu gia tri nguoi dung chon; luc dung se cat theo count
@@ -149,9 +162,11 @@ void loadSettings() {
   W.ssid[32] = 0; W.pass[64] = 0;
   EEPROM.get(LED_EEPROM_OFF, S);
   if (S.magic != LMAGIC) defaults();
+  EEPROM.get(CAL_EEPROM_OFF, CL);
+  if (CL.magic != CMAGIC) defaultsCal();
   sanitize();
 }
-void saveSettings() { EEPROM.put(LED_EEPROM_OFF, S); EEPROM.commit(); }
+void saveSettings() { EEPROM.put(LED_EEPROM_OFF, S); EEPROM.put(CAL_EEPROM_OFF, CL); EEPROM.commit(); }
 void saveWifi()     { EEPROM.put(0, W); EEPROM.commit(); }
 
 // ====================== HIEU UNG ======================
@@ -250,15 +265,22 @@ void renderFrame() {
   }
 }
 
-// Gui buf ra day, ap dung do sang + thu tu mau rieng tung doan
+// Gui buf ra day, ap dung do sang + can chinh mau + thu tu mau rieng tung doan
 void pushFrame() {
   const uint16_t n = S.count, split = effSplit();
   const uint16_t br = (uint16_t)S.bright + 1;
   const uint8_t *p1 = PERM[S.o1], *p2 = PERM[S.o2];
+  uint16_t m1[3], m2[3];                       // do sang x he so can chinh, theo kenh logic R,G,B (toi da 256)
+  for (uint8_t k = 0; k < 3; k++) {
+    m1[k] = ((uint32_t)br * (CL.g[0][k] + 1)) >> 8;
+    m2[k] = ((uint32_t)br * (CL.g[1][k] + 1)) >> 8;
+  }
   for (uint16_t i = 0; i < n; i++) {
-    const uint8_t* P = (i < split) ? p1 : p2;
+    const bool a = i < split;
+    const uint8_t* P = a ? p1 : p2;
+    const uint16_t* M = a ? m1 : m2;
     const uint8_t* L = buf[i];
-    strip.setPixelColor(i, (L[P[0]] * br) >> 8, (L[P[1]] * br) >> 8, (L[P[2]] * br) >> 8);
+    strip.setPixelColor(i, (L[P[0]] * M[P[0]]) >> 8, (L[P[1]] * M[P[1]]) >> 8, (L[P[2]] * M[P[2]]) >> 8);
   }
   strip.show();
   lastPush = millis();
@@ -276,7 +298,8 @@ void pushTest() {
         uint8_t L[3] = {0, 0, 0};
         if (testC == 3) { L[0] = L[1] = L[2] = 160; } else if (testC < 3) L[testC] = 160;
         const uint8_t* P = PERM[seg == 1 ? S.o1 : S.o2];
-        for (uint8_t k = 0; k < 3; k++) b[k] = L[P[k]];
+        const uint8_t* G = CL.g[seg - 1];                      // thu mau co ap dung can chinh
+        for (uint8_t k = 0; k < 3; k++) b[k] = (L[P[k]] * (G[P[k]] + 1)) >> 8;
       }
     }
     strip.setPixelColor(i, b[0], b[1], b[2]);
@@ -421,17 +444,7 @@ void wifiTask() {
   }
 }
 
-// ====================== DEN TRANG THAI / NUT / CHAN DOAN ======================
-void statusTask() {
-  if (STATUS_LED < 0) return;
-  uint32_t t = millis();
-  bool on;
-  if (portalActive)                        on = (t % 300) < 150;     // dang phat AP: nhay nhanh
-  else if (WiFi.status() == WL_CONNECTED)  on = (t % 3000) < 80;     // da vao WiFi: nhay ngan moi 3 giay
-  else                                     on = (t % 1200) < 600;    // dang tim WiFi: nhay cham
-  digitalWrite(STATUS_LED, on ? LOW : HIGH);
-}
-
+// ====================== NUT / CHAN DOAN ======================
 // Giu nut FLASH >= BTN_HOLD_MS: mo AP va giu mo; giu lan nua: dong AP (chi khi da co WiFi nha)
 void buttonTask() {
   if (BTN_PIN < 0) return;
@@ -517,7 +530,7 @@ void handleStatus() {
 void handleCloseAp() { closeApReq = true; sendJson(F("{\"ok\":1}")); }
 
 String stateJson() {
-  String s; s.reserve(480);
+  String s; s.reserve(520);
   s += F("{\"on\":");     s += S.on;
   s += F(",\"n\":");      s += S.count;
   s += F(",\"max\":");    s += MAX_LEDS;
@@ -529,6 +542,9 @@ String stateJson() {
   s += F("\",\"split\":"); s += S.split;
   s += F(",\"o1\":");     s += S.o1;
   s += F(",\"o2\":");     s += S.o2;
+  s += F(",\"g1\":\"");   s += hex6(CL.g[0]);
+  s += F("\",\"g2\":\""); s += hex6(CL.g[1]);
+  s += '"';
   s += F(",\"zon\":");    s += S.zoneOn;
   s += F(",\"zs\":");     s += S.zs;
   s += F(",\"ze\":");     s += S.ze;
@@ -563,6 +579,9 @@ void handleSet() {
   if (argL("mode", 0, MODE_COUNT - 1, v)) { if (S.mode != v) { S.mode = v; memset(buf, 0, sizeof(buf)); } }
   if (argL("speed", 1, 255, v))     S.speed = v;
   argColor("c1", S.c1); argColor("c2", S.c2);
+  bool calSet = server.hasArg("g1") || server.hasArg("g2");     // can chinh mau: hex RRGGBB, ff = 100%
+  argColor("g1", CL.g[0]); argColor("g2", CL.g[1]);
+  if (calSet && testSeg && !testRaw) testUntil = millis() + 10000UL;   // dang thu mau: keo thanh khong bi tat giua chung
   if (argL("o1", 0, 5, v))          S.o1 = v;
   if (argL("o2", 0, 5, v))          S.o2 = v;
   if (argL("zon", 0, 1, v))         S.zoneOn = v;
@@ -627,14 +646,13 @@ void setup() {
   Serial.begin(115200);
   randomSeed(analogRead(A0) ^ micros());
   WiFi.persistent(false);
-  EEPROM.begin(LED_EEPROM_OFF + sizeof(Settings));
+  EEPROM.begin(CAL_EEPROM_OFF + sizeof(Calib));
   loadSettings();
 
   if (LED_POWER_PIN >= 0) {
     pinMode(LED_POWER_PIN, OUTPUT);
     digitalWrite(LED_POWER_PIN, S.on ? LED_POWER_ON : !LED_POWER_ON);
   }
-  if (STATUS_LED >= 0) { pinMode(STATUS_LED, OUTPUT); digitalWrite(STATUS_LED, HIGH); }
   if (BTN_PIN >= 0) pinMode(BTN_PIN, INPUT_PULLUP);
   strip.begin(); strip.clear(); strip.show();
   strip.updateLength(S.count);
@@ -676,7 +694,6 @@ void loop() {
   MDNS.update();
   wifiTask();
   buttonTask();
-  statusTask();
   netReport();
   ledTask();
   if (saveAt && (int32_t)(millis() - saveAt) >= 0) { saveAt = 0; saveSettings(); }
