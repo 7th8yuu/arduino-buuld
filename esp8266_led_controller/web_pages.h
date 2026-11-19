@@ -7,7 +7,7 @@
 
 #include <pgmspace.h>
 
-// ---- giao dien dung chung (/ui.css) ----
+// ---- giao dien dung chung (/ui.css?v=2; doi so v khi sua CSS de ep dien thoai tai lai) ----
 static const char PAGE_CSS[] PROGMEM =
   ":root{--bg:#101114;--s1:#181a1f;--s2:#22252c;--line:#2c3039;--txt:#eceef2;--mut:#9aa0ad;--ac:#ffb02e;--acd:#1b1305;--ok:#47d18a;--bad:#ff6b6b;--blue:#5aa9ff;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\n"
   "*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}\n"
@@ -141,7 +141,7 @@ static const char PAGE_CSS[] PROGMEM =
 static const char PAGE_PORTAL[] PROGMEM =
   "<!doctype html><html lang=vi><head><meta charset=utf-8>\n"
   "<meta name=viewport content=\"width=device-width,initial-scale=1,viewport-fit=cover\">\n"
-  "<meta name=theme-color content=\"#101114\"><title>C\303\240i \304\221\341\272\267t WiFi</title><link rel=stylesheet href=/ui.css></head><body>\n"
+  "<meta name=theme-color content=\"#101114\"><title>C\303\240i \304\221\341\272\267t WiFi</title><link rel=stylesheet href=/ui.css?v=2></head><body>\n"
   "<div class=\"app np\">\n"
   "<header class=hd><div class=hrow><div class=ttl><h1>K\341\272\277t n\341\273\221i WiFi</h1><div class=meta>\304\220\303\250n LED ch\306\260a v\303\240o m\341\272\241ng WiFi nh\303\240</div></div></div></header>\n"
   "<main>\n"
@@ -234,7 +234,7 @@ static const char PAGE_PORTAL[] PROGMEM =
 static const char PAGE_APP[] PROGMEM =
   "<!doctype html><html lang=vi><head><meta charset=utf-8>\n"
   "<meta name=viewport content=\"width=device-width,initial-scale=1,viewport-fit=cover\">\n"
-  "<meta name=theme-color content=\"#101114\"><title>LED Controller</title><link rel=stylesheet href=/ui.css></head><body>\n"
+  "<meta name=theme-color content=\"#101114\"><title>LED Controller</title><link rel=stylesheet href=/ui.css?v=2></head><body>\n"
   "<div class=app>\n"
   "<header class=hd>\n"
   "<div class=hrow>\n"

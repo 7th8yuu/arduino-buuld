@@ -1308,7 +1308,7 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/app", HTTP_GET, []() { server.send_P(200, "text/html; charset=utf-8", PAGE_APP); });
   server.on("/ui.css", HTTP_GET, []() {
-    server.sendHeader("Cache-Control", "max-age=86400");
+    server.sendHeader("Cache-Control", "no-cache");           // CSS chi 10 KB: luon lay ban moi, khong de dien thoai giu ban cu
     server.send_P(200, "text/css; charset=utf-8", PAGE_CSS);
   });
   server.on("/scan", HTTP_GET, handleScan);
