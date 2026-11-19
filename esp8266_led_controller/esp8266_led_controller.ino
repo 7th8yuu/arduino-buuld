@@ -21,6 +21,9 @@
     Noi dien thoai vao "LED-Setup" roi mo http://192.168.4.1 de dieu khien truc tiep, khong
     can qua router. Giu 2 giay lan nua = dong AP.
   Serial 115200: in MAC, IP, gateway, RSSI luc vao WiFi va moi 15 giay.
+  TCP (de lam app): cong 7777, moi lenh 1 dong chu, tra loi 1 dong JSON. Xem PROTOCOL.md.
+    Web server van chay binh thuong song song; TCP va web dung chung logic lenh.
+    App tu tim thiet bi qua mDNS dich vu _ledctl._tcp.
 */
 
 #include <ESP8266WiFi.h>
@@ -42,6 +45,11 @@
 #define BTN_PIN        0          // nut FLASH tren NodeMCU (GPIO0); -1 = khong dung
 #define BTN_HOLD_MS    2000UL     // giu nut lau hon the nay thi mo/dong AP "LED-Setup"
 #define AUTO_REFRESH_MS 4000UL    // gui lai khung tinh moi 4 giay: LED bi reset do sut nguon se tu sang lai
+#define TCP_PORT       7777       // cong TCP cho app; 0 = tat TCP
+#define TCP_TOKEN      ""         // mat khau TCP; de "" = khong can. Neu dat, app phai gui AUTH <mat khau> truoc
+#define TCP_MAX        3          // so ket noi TCP dong thoi
+#define TCP_IDLE_MS    120000UL   // ngat ket noi TCP neu 2 phut khong nhan duoc gi (app gui PING moi 30 giay)
+#define TCP_PROTO      1          // phien ban giao thuc
 // ======================================================
 
 #define WMAGIC 0x4C454433UL       // vung WiFi (giu nguyen ma cu de khong mat WiFi da luu)
@@ -873,6 +881,10 @@ void onConnected() {
                 WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(), (int)WiFi.RSSI());
   MDNS.begin(HOSTNAME);
   MDNS.addService("http", "tcp", 80);
+#if TCP_PORT
+  MDNS.addService("ledctl", "tcp", TCP_PORT);          // app tim thiet bi: _ledctl._tcp
+  MDNS.addServiceTxt("ledctl", "tcp", "proto", "1");           // = TCP_PROTO
+#endif
   applyPower();
 }
 
@@ -1034,14 +1046,30 @@ String stateJson() {
   return s;
 }
 
+// Nguon tham so dung chung: HTTP (server.arg) hoac dong lenh TCP (k=v). Cung mot ham xu ly cho ca hai.
+#define TCP_ARGS_MAX 12
+static String  tcpK[TCP_ARGS_MAX], tcpV[TCP_ARGS_MAX];
+static uint8_t tcpN = 0;
+static bool    fromTcp = false;
+static uint32_t stateVer = 1;                 // tang moi khi cai dat doi: de day su kien cho app dang SUB
+static bool hasArg(const char* k) {
+  if (!fromTcp) return server.hasArg(k);
+  for (uint8_t i = 0; i < tcpN; i++) if (tcpK[i] == k) return true;
+  return false;
+}
+static String argStr(const char* k) {
+  if (!fromTcp) return server.arg(k);
+  for (uint8_t i = 0; i < tcpN; i++) if (tcpK[i] == k) return tcpV[i];
+  return String();
+}
 static bool argL(const char* k, long mn, long mx, long& out) {
-  if (!server.hasArg(k)) return false;
-  out = clampL(server.arg(k).toInt(), mn, mx);
+  if (!hasArg(k)) return false;
+  out = clampL(argStr(k).toInt(), mn, mx);
   return true;
 }
 static void argColor(const char* k, uint8_t* c) {
-  if (!server.hasArg(k)) return;
-  String h = server.arg(k);
+  if (!hasArg(k)) return;
+  String h = argStr(k);
   if (h.length() != 6) return;
   uint32_t v = strtoul(h.c_str(), nullptr, 16);
   c[0] = v >> 16; c[1] = v >> 8; c[2] = v;
@@ -1049,14 +1077,14 @@ static void argColor(const char* k, uint8_t* c) {
 
 void handleState() { sendJson(stateJson()); }
 
-void handleSet() {
+String doSet() {
   long v;
   if (argL("on", 0, 1, v))          { if (S.on != v) { S.on = v; powerChanged = true; } }
   if (argL("bright", 1, 255, v))    S.bright = v;
   if (argL("mode", 0, MODE_COUNT - 1, v)) { if (S.mode != v) { S.mode = v; resetFx(); } }
   if (argL("speed", 1, 255, v))     S.speed = v;
   argColor("c1", S.c1); argColor("c2", S.c2);
-  bool calSet = server.hasArg("g1") || server.hasArg("g2");     // can chinh mau: hex RRGGBB, ff = 100%
+  bool calSet = hasArg("g1") || hasArg("g2");     // can chinh mau: hex RRGGBB, ff = 100%
   argColor("g1", CL.g[0]); argColor("g2", CL.g[1]);
   if (calSet && testSeg && !testRaw) testUntil = millis() + 10000UL;   // dang thu mau: keo thanh khong bi tat giua chung
   if (argL("o1", 0, 5, v))          S.o1 = v;
@@ -1066,11 +1094,13 @@ void handleSet() {
   if (argL("ze", 1, MAX_LEDS, v))   S.ze = v;
   sanitize();
   dirty = true; saveAt = millis() + 1500;
-  sendJson(stateJson());
+  stateVer++;
+  return stateJson();
 }
+void handleSet() { sendJson(doSet()); }
 
 // Ap dung so LED + diem chia 2 doan cung luc (nut "Ap dung" tren web)
-void handleApply() {
+String doApply() {
   long n = S.count, sp = S.split;
   argL("n", 1, MAX_LEDS, n);
   argL("split", 1, MAX_LEDS, sp);
@@ -1079,12 +1109,14 @@ void handleApply() {
   S.split = sp;
   sanitize();
   resendFrames = 3; dirty = true; saveAt = millis() + 500;
-  sendJson(stateJson());
+  stateVer++;
+  return stateJson();
 }
+void handleApply() { sendJson(doApply()); }
 
 void handleRefresh() { refreshReq = true; sendJson(F("{\"ok\":1}")); }
 
-void handleTest() {
+String doTest() {
   long seg = 0, c = 255, raw = 0;
   argL("seg", 0, 2, seg); argL("c", 0, 255, c); argL("raw", 0, 1, raw);
   if (seg == 0 || c == 255) testSeg = 0;
@@ -1093,8 +1125,9 @@ void handleTest() {
     if (!S.on) { S.on = 1; powerChanged = true; }
   }
   dirty = true;
-  sendJson(F("{\"ok\":1}"));
+  return F("{\"ok\":1}");
 }
+void handleTest() { sendJson(doTest()); }
 
 void handleDeepSleep() {
   sendJson(F("{\"ok\":1}"));
@@ -1117,6 +1150,135 @@ void handleNotFound() {
     server.send(302, "text/plain", "");
   } else server.send(404, "text/plain", "404");
 }
+
+// ====================== TCP (cho app) ======================
+// Giao thuc: moi lenh la 1 dong chu ket thuc bang \n (chap nhan \r\n):  LENH [khoa=gia_tri ...]
+// Moi tra loi la 1 dong JSON. Loi: {"ok":0,"err":"..."}. Su kien (sau SUB 1): {"ev":"state","s":{...}}
+#if TCP_PORT
+#define TCP_LINE 160
+static WiFiServer tcpServer(TCP_PORT);
+static WiFiClient tcpC[TCP_MAX];
+static char       tcpLine[TCP_MAX][TCP_LINE];
+static uint8_t    tcpLen[TCP_MAX];
+static bool       tcpOver[TCP_MAX], tcpSub[TCP_MAX], tcpAuth[TCP_MAX];
+static uint32_t   tcpRx[TCP_MAX], tcpSeen[TCP_MAX], tcpPushAt[TCP_MAX];
+
+static void tcpDrop(uint8_t i) {
+  tcpC[i].stop();
+  tcpLen[i] = 0; tcpOver[i] = tcpSub[i] = tcpAuth[i] = false;
+}
+
+static void tcpReply(uint8_t i, const String& s) {
+  WiFiClient& c = tcpC[i];
+  if (!c.connected()) return;
+  String t = s; t += '\n';
+  if ((size_t)c.availableForWrite() < t.length()) { tcpDrop(i); return; }   // client khong doc: ngat, khong de treo vong lap
+  c.write((const uint8_t*)t.c_str(), t.length());
+}
+
+static String tcpErr(const char* m) { String r = F("{\"ok\":0,\"err\":\""); r += m; r += F("\"}"); return r; }
+
+static String tcpHello() {
+  String r; r.reserve(140);
+  r += F("{\"ok\":1,\"proto\":");  r += TCP_PROTO;
+  r += F(",\"name\":\"LED Controller\",\"host\":\""); r += HOSTNAME;
+  r += F("\",\"modes\":");         r += MODE_COUNT;
+  r += F(",\"max\":");             r += MAX_LEDS;
+  r += F(",\"auth\":");            r += (TCP_TOKEN[0] ? 1 : 0);
+  r += '}';
+  return r;
+}
+
+static char* tcpTok(char*& p) {                 // lay tu tiep theo, cat bang khoang trang
+  while (*p == ' ' || *p == '\t') p++;
+  if (!*p) return nullptr;
+  char* t = p;
+  while (*p && *p != ' ' && *p != '\t') p++;
+  if (*p) *p++ = 0;
+  return t;
+}
+
+static void tcpLineDone(uint8_t i, char* line) {
+  char* p = line;
+  char* cmd = tcpTok(p);
+  if (!cmd) return;                              // dong trong: bo qua
+  char* pos = nullptr;                           // tham so dau tien khong co '='
+  tcpN = 0;
+  while (char* t = tcpTok(p)) {
+    char* eq = strchr(t, '=');
+    if (!eq) { if (!pos) pos = t; continue; }
+    if (tcpN >= TCP_ARGS_MAX) continue;
+    *eq = 0;
+    for (char* q = t; *q; q++) *q = tolower((unsigned char)*q);
+    tcpK[tcpN] = t; tcpV[tcpN] = eq + 1; tcpN++;
+  }
+  const uint32_t before = stateVer;
+  String r;
+  if      (!strcasecmp(cmd, "PING"))  r = F("{\"ok\":1,\"pong\":1}");
+  else if (!strcasecmp(cmd, "HELLO")) r = tcpHello();
+  else if (!strcasecmp(cmd, "AUTH")) {
+    if (!TCP_TOKEN[0] || (pos && !strcmp(pos, TCP_TOKEN))) { tcpAuth[i] = true; r = F("{\"ok\":1}"); }
+    else r = tcpErr("auth");
+  }
+  else if (TCP_TOKEN[0] && !tcpAuth[i]) r = tcpErr("auth");
+  else if (!strcasecmp(cmd, "STATE"))   r = stateJson();
+  else if (!strcasecmp(cmd, "SET"))     { fromTcp = true; r = doSet();   fromTcp = false; }
+  else if (!strcasecmp(cmd, "APPLY"))   { fromTcp = true; r = doApply(); fromTcp = false; }
+  else if (!strcasecmp(cmd, "TEST"))    { fromTcp = true; r = doTest();  fromTcp = false; }
+  else if (!strcasecmp(cmd, "REFRESH")) { refreshReq = true; r = F("{\"ok\":1}"); }
+  else if (!strcasecmp(cmd, "SUB"))     { tcpSub[i] = !(pos && !strcmp(pos, "0")); tcpSeen[i] = stateVer; r = F("{\"ok\":1}"); }
+  else r = tcpErr("unknown");
+  if (stateVer != before) tcpSeen[i] = stateVer;  // nguoi gui khong nhan lai su kien do chinh minh gay ra
+  tcpReply(i, r);
+}
+
+static void tcpTask() {
+  const uint32_t now = millis();
+  // nhan ket noi moi; het cho thi thay ket noi im lau lau nhat (app doi mang de lai ket noi chet)
+  WiFiClient nc = tcpServer.accept();
+  if (nc) {
+    int slot = -1;
+    for (uint8_t i = 0; i < TCP_MAX && slot < 0; i++) if (!tcpC[i].connected()) slot = i;
+    if (slot < 0) {
+      slot = 0;
+      for (uint8_t i = 1; i < TCP_MAX; i++) if ((int32_t)(tcpRx[slot] - tcpRx[i]) > 0) slot = i;
+    }
+    tcpDrop(slot);
+    tcpC[slot] = nc;
+    tcpC[slot].setNoDelay(true);
+    tcpRx[slot] = now; tcpSeen[slot] = stateVer; tcpPushAt[slot] = now;
+    tcpAuth[slot] = !TCP_TOKEN[0];
+  }
+  for (uint8_t i = 0; i < TCP_MAX; i++) {
+    WiFiClient& c = tcpC[i];
+    if (!c.connected()) { if (tcpLen[i] || tcpSub[i]) tcpDrop(i); continue; }
+    uint8_t budget = 96;                          // doc toi da 96 byte/vong de khong lam cham LED
+    while (budget-- && c.available()) {
+      int ch = c.read();
+      if (ch < 0) break;
+      tcpRx[i] = now;
+      if (ch == '\r') continue;
+      if (ch == '\n') {
+        tcpLine[i][tcpLen[i]] = 0;
+        if (tcpOver[i]) { tcpOver[i] = false; tcpReply(i, tcpErr("too long")); }
+        else tcpLineDone(i, tcpLine[i]);
+        tcpLen[i] = 0;
+        if (!c.connected()) break;
+        continue;
+      }
+      if (tcpLen[i] < TCP_LINE - 1) tcpLine[i][tcpLen[i]++] = (char)ch;
+      else tcpOver[i] = true;                     // dong qua dai: bo het cho den het dong
+    }
+    if (!c.connected()) continue;
+    if ((int32_t)(now - tcpRx[i]) > (int32_t)TCP_IDLE_MS) { tcpDrop(i); continue; }
+    if (tcpSub[i] && tcpSeen[i] != stateVer && (int32_t)(now - tcpPushAt[i]) >= 150) {
+      tcpSeen[i] = stateVer; tcpPushAt[i] = now;
+      String ev = F("{\"ev\":\"state\",\"s\":"); ev += stateJson(); ev += '}';
+      tcpReply(i, ev);
+    }
+  }
+}
+#endif
 
 // ====================== SETUP / LOOP ======================
 void setup() {
@@ -1163,10 +1325,17 @@ void setup() {
   server.on("/api/restart", HTTP_POST, handleRestart);
   server.onNotFound(handleNotFound);
   server.begin();
+#if TCP_PORT
+  tcpServer.begin();
+  tcpServer.setNoDelay(true);
+#endif
 }
 
 void loop() {
   server.handleClient();
+#if TCP_PORT
+  tcpTask();
+#endif
   if (portalActive) dns.processNextRequest();
   MDNS.update();
   wifiTask();
