@@ -45,11 +45,19 @@
 #define BTN_PIN        0          // nut FLASH tren NodeMCU (GPIO0); -1 = khong dung
 #define BTN_HOLD_MS    2000UL     // giu nut lau hon the nay thi mo/dong AP "LED-Setup"
 #define AUTO_REFRESH_MS 4000UL    // gui lai khung tinh moi 4 giay: LED bi reset do sut nguon se tu sang lai
+#define FRAME_MS       33         // ~30 khung/giay. Moi lan strip.show() NeoPixel TAT NGAT ~30us/LED (146 LED = 4,4 ms)
 #define TCP_PORT       7777       // cong TCP cho app; 0 = tat TCP
 #define TCP_TOKEN      ""         // mat khau TCP; de "" = khong can. Neu dat, app phai gui AUTH <mat khau> truoc
-#define TCP_MAX        3          // so ket noi TCP dong thoi
+#define TCP_MAX        2          // so ket noi TCP dong thoi. Loi ESP8266 chi co 5 ket noi TCP chung cho web + app: de du cho trinh duyet
 #define TCP_IDLE_MS    120000UL   // ngat ket noi TCP neu 2 phut khong nhan duoc gi (app gui PING moi 30 giay)
 #define TCP_PROTO      1          // phien ban giao thuc
+// Tu phuc hoi (xem healthTask): thiet bi tu khoi dong lai thay vi dung im khi WiFi/bo nho hong
+#define WIFI_RESTART_MS 600000UL  // mat WiFi nha lien tuc qua 10 phut -> tu khoi dong lai (khong khi dang cai WiFi bang AP)
+#define HEAP_MIN_FREE  8000       // heap trong < nguong nay, hoac khoi trong lien tuc lon nhat < HEAP_MIN_BLOCK ...
+#define HEAP_MIN_BLOCK 3000
+#define HEAP_LOW_MS    5000UL     // ... keo dai ngan nay -> tu khoi dong lai
+#define KEEPALIVE_MS   20000UL    // moi 20 giay gui 1 goi UDP nho toi router: giu router khong "quen" thiet bi
+#define HEALTH_RTC_OFF 40         // vi tri trong RTC memory (don vi 4 byte), tranh vung eboot o dau
 // ======================================================
 
 #define WMAGIC 0x4C454433UL       // vung WiFi (giu nguyen ma cu de khong mat WiFi da luu)
@@ -114,6 +122,23 @@ uint8_t  testSeg = 0, testC = 0; bool testRaw = false; uint32_t testUntil = 0;
 bool     refreshReq = false;               // yeu cau lam moi toan bo LED
 uint8_t  resendFrames = 0;                 // gui lai khung hinh vai lan sau khi doi cau hinh
 uint32_t lastPush = 0;                     // lan gui cuoi ra day LED
+
+// chan doan / tu phuc hoi (hien o tab Cai dat; xem healthTask)
+struct Health {                            // luu trong RTC memory: song qua khoi dong lai, mat khi mat dien, khong mon flash
+  uint32_t magic;
+  uint16_t nWifi, nHeap;                   // so lan tu khoi dong lai vi mat WiFi / can bo nho
+  uint8_t  last, pad8;                     // lan tu khoi dong lai cuoi: 0 chua co, 1 WiFi, 2 bo nho
+  uint16_t pad16;
+  uint32_t lastUp;                         // so giay da chay truoc lan do
+};
+#define HMAGIC 0x48454C31UL                // "HEL1"
+Health   H;
+uint16_t wDrops = 0;                       // so lan WiFi nha dang noi bi rot (tu luc bat)
+uint8_t  wReason = 0;                      // ma ly do ngat cuoi (200 = mat beacon, 201 = khong thay router, 8 = tu roi...)
+uint32_t wDropAt = 0;                      // millis() cua lan rot cuoi (0 = chua rot)
+uint32_t minHeap = 0xFFFFFFFFUL;           // heap trong thap nhat tu luc bat
+uint16_t maxGap = 0, stalls = 0;           // khoang cach lon nhat giua 2 vong loop (ms), so lan > 500 ms
+static WiFiEventHandler hDisc;
 
 // ====================== TRANG WEB (PROGMEM) ======================
 #include "web_pages.h"
@@ -750,8 +775,14 @@ void renderFrame() {
   }
 }
 
-// Gui buf ra day, ap dung do sang + can chinh mau + thu tu mau rieng tung doan
-void pushFrame() {
+// strip.show() cua NeoPixel tat NGAT suot luc gui (~4,4 ms voi 146 LED) -> WiFi bi cham tre trong luc do.
+// Nen chi goi khi khung that su doi: so sanh ma bam cua du lieu se gui voi khung truoc.
+static uint32_t frameHash = 0;
+static bool     hashOk = false;                // false: ma bam khong con dung (day vua bi xoa/ve mau thu) -> bat buoc gui
+static uint32_t showCount = 0, skipCount = 0;
+
+// force = true: luon gui (vua doi so LED / lam moi: gui lai vai khung de chac chan)
+void pushFrame(bool force) {
   const uint16_t n = S.count, split = effSplit();
   const uint16_t br = (uint16_t)S.bright + 1;
   const uint8_t *p1 = PERM[S.o1], *p2 = PERM[S.o2];
@@ -760,14 +791,21 @@ void pushFrame() {
     m1[k] = ((uint32_t)br * (CL.g[0][k] + 1)) >> 8;
     m2[k] = ((uint32_t)br * (CL.g[1][k] + 1)) >> 8;
   }
+  uint32_t h = 2166136261UL;                   // FNV-1a
   for (uint16_t i = 0; i < n; i++) {
     const bool a = i < split;
     const uint8_t* P = a ? p1 : p2;
     const uint16_t* M = a ? m1 : m2;
     const uint8_t* L = buf[i];
-    strip.setPixelColor(i, (L[P[0]] * M[P[0]]) >> 8, (L[P[1]] * M[P[1]]) >> 8, (L[P[2]] * M[P[2]]) >> 8);
+    const uint8_t x = (L[P[0]] * M[P[0]]) >> 8, y = (L[P[1]] * M[P[1]]) >> 8, z = (L[P[2]] * M[P[2]]) >> 8;
+    strip.setPixelColor(i, x, y, z);
+    h = (h ^ x) * 16777619UL; h = (h ^ y) * 16777619UL; h = (h ^ z) * 16777619UL;
   }
+  const uint32_t now = millis();
+  if (!force && hashOk && h == frameHash && now - lastPush < AUTO_REFRESH_MS) { skipCount++; return; }
+  frameHash = h; hashOk = true;
   strip.show();
+  showCount++;
   lastPush = millis();
 }
 
@@ -789,11 +827,13 @@ void pushTest() {
     }
     strip.setPixelColor(i, b[0], b[1], b[2]);
   }
+  hashOk = false;                              // day dang hien mau thu: khung thuong ke tiep phai gui lai
   strip.show();
   lastPush = millis();
 }
 
 void applyCount() {
+  hashOk = false;
   strip.clear(); strip.show();               // tat het o do dai cu
   delay(2);
   strip.updateLength(S.count);
@@ -805,6 +845,7 @@ void applyCount() {
 
 // Lam moi toan bo LED: dat lai chan data, xoa het, roi gui lai khung hinh vai lan
 void doRefresh() {
+  hashOk = false;
   strip.begin();
   strip.updateLength(S.count);
   strip.clear(); strip.show();
@@ -820,6 +861,7 @@ void applyPower() {
     if (!portalActive) WiFi.setSleepMode(WIFI_NONE_SLEEP);
     dirty = true;
   } else {
+    hashOk = false;
     strip.clear(); strip.show();
     if (LED_POWER_PIN >= 0) digitalWrite(LED_POWER_PIN, !LED_POWER_ON);
     // Tat den KHONG co nghia la ngu: WiFi luon bat het cong suat de luon online 100%
@@ -837,19 +879,19 @@ void ledTask() {
   if (testSeg && !testing) { testSeg = 0; dirty = true; }
 
   if (!S.on) {                                    // dang ngu: giu LED toi
-    if (dirty) { strip.clear(); strip.show(); dirty = false; }
+    if (dirty) { hashOk = false; strip.clear(); strip.show(); dirty = false; }
     return;
   }
   if (!dirty && !testing && S.mode == MODE_SOLID && now - lastPush > AUTO_REFRESH_MS) dirty = true;   // gui lai dinh ky
   if (!dirty && (testing || S.mode == MODE_SOLID)) return;   // tinh: khong can gui lai
-  if (now - lastFrame < 25) return;                          // ~40 khung/giay
+  if (now - lastFrame < FRAME_MS) return;
   uint32_t dt = now - lastFrame; lastFrame = now; if (dt > 100) dt = 100;
 
   if (testing) { pushTest(); dirty = false; return; }
   phaseAcc += dt * (20 + (uint32_t)S.speed * 8);
   ph = (phaseAcc >> 4) & 0xFFFF;
   renderFrame();
-  pushFrame();
+  pushFrame(resendFrames > 0);
   dirty = false;
   if (resendFrames) { resendFrames--; dirty = true; }       // gui them vai khung de chac chan LED nhan du
 }
@@ -901,6 +943,7 @@ void wifiTask() {
   wl_status_t st = WiFi.status();
   bool conn = (st == WL_CONNECTED);
   if (conn && !was) onConnected();
+  if (!conn && was) { wDrops++; wDropAt = millis() | 1; }          // dem so lan dang noi bi rot (de chan doan)
   was = conn;
 
   if (connState == C_CONNECTING) {
@@ -955,6 +998,64 @@ void netReport() {
   Serial.printf("[net] wifi=%d ip=%s gw=%s rssi=%d ap=%d heap=%u\n", (int)WiFi.status(),
                 WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
                 (int)WiFi.RSSI(), portalActive ? 1 : 0, (unsigned)ESP.getFreeHeap());
+}
+
+// ====================== SUC KHOE / TU PHUC HOI ======================
+static void healthLoad() {
+  if (!ESP.rtcUserMemoryRead(HEALTH_RTC_OFF, (uint32_t*)&H, sizeof(H)) || H.magic != HMAGIC) {
+    memset(&H, 0, sizeof(H)); H.magic = HMAGIC;          // vua mat dien (RTC memory rong) -> dem lai tu dau
+  }
+}
+
+// cause: 1 = mat WiFi qua lau, 2 = can bo nho. Ghi vao RTC memory de tab Cai dat bao lai sau khi khoi dong.
+static void selfRestart(uint8_t cause) {
+  if (cause == 1) { if (H.nWifi < 65535) H.nWifi++; } else { if (H.nHeap < 65535) H.nHeap++; }
+  H.last = cause; H.lastUp = millis() / 1000;
+  ESP.rtcUserMemoryWrite(HEALTH_RTC_OFF, (uint32_t*)&H, sizeof(H));
+  Serial.printf("[health] tu khoi dong lai, ly do=%u up=%us heap=%u\n", cause, (unsigned)(millis() / 1000), (unsigned)ESP.getFreeHeap());
+  delay(100);
+  ESP.restart();
+}
+
+// Moi 20 giay gui 1 goi UDP 1 byte toi router. Phong ho (CHUA kiem chung tren phan cung): mot so router/AP xoa
+// thiet bi it phat tin khoi bang dia chi, luc do web/app khong toi duoc ESP du ESP van hien dang noi WiFi.
+static void keepalive() {
+  const IPAddress gw = WiFi.gatewayIP();
+  if (!(uint32_t)gw) return;
+  WiFiUDP u;
+  if (u.beginPacket(gw, 9)) { u.write((uint8_t)0); u.endPacket(); }
+  u.stop();
+}
+
+// Goi moi vong loop(). Khong chan, khong cap phat bo nho.
+static void healthTask() {
+  static uint32_t lastLoop = 0, sampleAt = 0, lowSince = 0, downSince = 0, kaAt = 0;
+  const uint32_t now = millis();
+
+  if (lastLoop) {                                         // vong loop bi chan bao lau (web/TCP/flash...)
+    uint32_t g = now - lastLoop;
+    if (g > maxGap) maxGap = g > 65535 ? 65535 : g;
+    if (g > 500) stalls++;
+  }
+  lastLoop = now;
+
+  if (now - sampleAt >= 500) {                            // bo nho: lay mau moi 0,5 giay (getMaxFreeBlockSize duyet heap)
+    sampleAt = now;
+    const uint32_t fh = ESP.getFreeHeap();
+    if (fh < minHeap) minHeap = fh;
+    if (fh < HEAP_MIN_FREE || ESP.getMaxFreeBlockSize() < HEAP_MIN_BLOCK) {
+      if (!lowSince) lowSince = now | 1;
+      else if (now - lowSince > HEAP_LOW_MS) selfRestart(2);
+    } else lowSince = 0;
+  }
+
+  const bool up = (WiFi.status() == WL_CONNECTED);        // WiFi nha mat qua lau -> khoi dong lai (dang cai WiFi bang AP thi khong)
+  if (up || !W.ssid[0]) downSince = 0;
+  else if (!downSince) downSince = now | 1;
+  else if (now - downSince > WIFI_RESTART_MS && !manualAp && connState != C_CONNECTING && WiFi.softAPgetStationNum() == 0)
+    selfRestart(1);
+
+  if (up && now - kaAt >= KEEPALIVE_MS) { kaAt = now; keepalive(); }
 }
 
 // ====================== HTTP ======================
@@ -1019,7 +1120,7 @@ void handleStatus() {
 void handleCloseAp() { closeApReq = true; sendJson(F("{\"ok\":1}")); }
 
 String stateJson() {
-  String s; s.reserve(520);
+  String s; s.reserve(760);
   s += F("{\"on\":");     s += S.on;
   s += F(",\"n\":");      s += S.count;
   s += F(",\"max\":");    s += MAX_LEDS;
@@ -1042,7 +1143,25 @@ String stateJson() {
   s += F("\",\"up\":");  s += millis() / 1000;
   s += F(",\"heap\":");  s += ESP.getFreeHeap();
   s += F(",\"rst\":\""); s += jsonEsc(ESP.getResetReason());
-  s += F("\"}");
+  s += '"';
+  const uint32_t rr = ESP.getResetInfoPtr()->reason;     // chi tiet loi khi lan khoi dong cuoi la treo/exception
+  if (rr == REASON_WDT_RST || rr == REASON_EXCEPTION_RST || rr == REASON_SOFT_WDT_RST) {
+    s += F(",\"rinfo\":\""); s += jsonEsc(ESP.getResetInfo()); s += '"';
+  }
+  s += F(",\"wd\":");   s += wDrops;                   // chan doan (chi de hien thi, khong gay su kien)
+  s += F(",\"wr\":");   s += wReason;
+  s += F(",\"wa\":");   s += (wDropAt ? (long)((millis() - wDropAt) / 1000) : -1L);
+  s += F(",\"hmin\":"); s += (minHeap == 0xFFFFFFFFUL ? 0UL : (unsigned long)minHeap);
+  s += F(",\"hblk\":"); s += ESP.getMaxFreeBlockSize();
+  s += F(",\"gap\":");  s += maxGap;
+  s += F(",\"stl\":");  s += stalls;
+  s += F(",\"rw\":");   s += H.nWifi;
+  s += F(",\"rh\":");   s += H.nHeap;
+  s += F(",\"rl\":");   s += H.last;
+  s += F(",\"ru\":");   s += H.lastUp;
+  s += F(",\"skip\":"); s += skipCount;
+  s += F(",\"show\":"); s += showCount;
+  s += '}';
   return s;
 }
 
@@ -1287,6 +1406,8 @@ void setup() {
   WiFi.persistent(false);
   EEPROM.begin(CAL_EEPROM_OFF + sizeof(Calib));
   loadSettings();
+  healthLoad();
+  hDisc = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& e) { wReason = (uint8_t)e.reason; });
 
   if (LED_POWER_PIN >= 0) {
     pinMode(LED_POWER_PIN, OUTPUT);
@@ -1295,6 +1416,7 @@ void setup() {
   if (BTN_PIN >= 0) pinMode(BTN_PIN, INPUT_PULLUP);
   strip.begin(); strip.clear(); strip.show();
   strip.updateLength(S.count);
+  hashOk = false;
   dirty = true;
 
   WiFi.mode(WIFI_STA);
@@ -1332,6 +1454,7 @@ void setup() {
 }
 
 void loop() {
+  healthTask();
   server.handleClient();
 #if TCP_PORT
   tcpTask();

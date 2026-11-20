@@ -10,7 +10,7 @@ web và TCP dùng chung một đoạn xử lý lệnh nên cho kết quả giố
 | Cổng | `7777` (đổi `TCP_PORT` trong firmware, `0` = tắt TCP) |
 | Địa chỉ | IP của thiết bị (hiện ở tab Cài đặt), hoặc `ledctl.local`, hoặc `192.168.4.1` khi nối thẳng vào WiFi `LED-Setup` |
 | Tìm tự động | mDNS dịch vụ **`_ledctl._tcp`**, TXT `proto=1`. Android: `NsdManager`, iOS: `NWBrowser` |
-| Số kết nối cùng lúc | 3. Kết nối thứ 4 sẽ thay kết nối im lặng lâu nhất |
+| Số kết nối cùng lúc | 2. Kết nối thứ 3 sẽ thay kết nối im lặng lâu nhất (lõi ESP8266 chỉ có 5 kết nối TCP dùng chung cho web và app) |
 | Ngắt khi im lặng | 2 phút không nhận được gì. App nên gửi `PING` mỗi 30 giây |
 | Mật khẩu | Mặc định không cần. Đặt `TCP_TOKEN "chuoi"` trong firmware thì phải gửi `AUTH chuoi` trước |
 
@@ -70,10 +70,24 @@ Khoá lạ bị bỏ qua. Giá trị ngoài khoảng được kẹp về khoản
 ```json
 {"on":1,"n":146,"max":500,"bright":160,"mode":6,"speed":128,"c1":"2de2ff","c2":"0000ff",
  "split":49,"o1":0,"o2":2,"g1":"ffffff","g2":"ffffff","zon":0,"zs":1,"ze":10,
- "rssi":-58,"ip":"192.168.1.40","up":4000,"heap":30000,"rst":"Power On"}
+ "rssi":-58,"ip":"192.168.1.40","up":4000,"heap":30000,"rst":"Power On",
+ "wd":0,"wr":0,"wa":-1,"hmin":28000,"hblk":24000,"gap":12,"stl":0,"rw":0,"rh":0,"rl":0,"ru":0,"skip":0,"show":0}
 ```
 
 `rssi` (dBm), `up` (giây từ lúc bật), `heap` (byte trống) và `rst` (lý do khởi động lần cuối) chỉ để hiển thị.
+
+Nhóm chẩn đoán, cũng chỉ để hiển thị (app có thể bỏ qua):
+
+| Khoá | Ý nghĩa |
+|---|---|
+| `wd` | Số lần WiFi nhà đang nối bị rớt từ lúc bật |
+| `wr` | Mã lý do ngắt gần nhất (200 = mất beacon, 201 = không thấy router, 8 = tự rời...) |
+| `wa` | Số giây từ lần rớt gần nhất, `-1` nếu chưa rớt |
+| `hmin`, `hblk` | Heap trống thấp nhất từ lúc bật, và khối trống liền lớn nhất hiện tại (byte) |
+| `gap`, `stl` | Vòng lặp chính bị chặn lâu nhất (ms) và số lần chậm quá 0,5 giây |
+| `rw`, `rh`, `rl`, `ru` | ESP đã tự khởi động lại vì mất WiFi `rw` lần, vì cạn bộ nhớ `rh` lần; lần cuối do `rl` (1 WiFi, 2 bộ nhớ) sau `ru` giây chạy. Về 0 khi mất điện |
+| `show`, `skip` | Số lần thật sự gửi khung ra dây LED, và số khung giống hệt khung trước nên bỏ qua |
+| `rinfo` | Chỉ có khi lần khởi động cuối do treo/lỗi chương trình: chi tiết lỗi |
 
 ## Sự kiện
 
