@@ -1,0 +1,12 @@
+
+# app Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/assets/app.html
+android/app/src/main/assets/ui.css
+*.jks
+*.keystore
+# ngoai le: khoa ky APK cong khai cua du an (xem android/keystore/signing.properties)
+!android/keystore/ledctl.jks

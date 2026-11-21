@@ -1,0 +1,93 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "tools/extract_web.py"
+      - "esp8266_led_controller/web_pages.h"
+      - ".github/workflows/build-apk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write            # de dang file APK len Releases
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cai Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cai Gradle (co cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Lay giao dien web tu firmware
+        shell: bash
+        run: python3 tools/extract_web.py
+
+      - name: Bien dich va ky APK
+        shell: bash
+        working-directory: android
+        run: ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Kiem tra chu ky
+        id: sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee sign.log
+          GOT=$(grep -m1 'certificate SHA-256 digest' sign.log | sed 's/.*: *//' | tr 'A-F' 'a-f' | tr -d ':')
+          WANT=$(tr -d ' \n\r' < android/keystore/sha256.txt | tr 'A-F' 'a-f')
+          echo "Dau van tay chu ky: $GOT"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error title=Sai khoa ky::APK ky bang khoa khac voi khoa da chon ($GOT != $WANT). Se KHONG cai de len ban cu."
+            exit 1
+          fi
+          VN="1.0.${GITHUB_RUN_NUMBER}"
+          mkdir -p out
+          cp "$APK" out/LedController.apk
+          cp "$APK" "out/LedController-${VN}.apk"
+          echo "vn=$VN" >> "$GITHUB_OUTPUT"
+          {
+            echo "### APK Android"
+            echo
+            echo "- Phien ban: \`$VN\`"
+            echo "- Dung luong: $(du -h out/LedController.apk | cut -f1)"
+            echo "- Dau van tay chu ky (SHA-256): \`$GOT\`"
+            echo "- Tai ve: https://github.com/${GITHUB_REPOSITORY}/releases/download/apk-latest/LedController.apk"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Luu APK vao Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LedController-apk
+          path: out/LedController-${{ steps.sign.outputs.vn }}.apk
+          if-no-files-found: error
+
+      - name: Dang APK len Releases (link co dinh)
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete apk-latest --cleanup-tag --yes || true
+          gh release create apk-latest out/LedController.apk \
+            --target "$GITHUB_SHA" \
+            --title "Android APK moi nhat (${{ steps.sign.outputs.vn }})" \
+            --notes "Ban dung ${GITHUB_SHA::7}. Cai de len ban cu duoc vi cung khoa ky. Link tai co dinh: https://github.com/${GITHUB_REPOSITORY}/releases/download/apk-latest/LedController.apk"

@@ -3,6 +3,9 @@ name: Build ESP8266 firmware
 on:
   push:
     branches: ["**"]
+    paths-ignore:
+      - "android/**"
+      - ".github/workflows/build-apk.yml"
   pull_request:
   workflow_dispatch:
 

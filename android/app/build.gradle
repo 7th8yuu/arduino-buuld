@@ -1,0 +1,50 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// Khoa ky: doc tu android/keystore/signing.properties (khoa cong khai cua du an, xem README). Dung chung cho CI va build tren may.
+def ksProps = new Properties()
+rootProject.file('keystore/signing.properties').withInputStream { ksProps.load(it) }
+
+android {
+    namespace 'com.ledctl.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.ledctl.app'
+        minSdk 26
+        targetSdk 34
+        // versionCode phai LUON TANG thi moi cai de len ban cu. Dung so phut tu 1970 nen tang deu, khong phu thuoc so lan chay workflow.
+        versionCode (int) (System.currentTimeMillis() / 60000L)
+        versionName "1.0." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
+    }
+
+    signingConfigs {
+        release {
+            storeFile rootProject.file('keystore/' + ksProps['storeFile'])
+            storePassword ksProps['storePassword']
+            keyAlias ksProps['keyAlias']
+            keyPassword ksProps['keyPassword']
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}

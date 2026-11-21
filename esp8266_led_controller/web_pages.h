@@ -670,6 +670,7 @@ static const char PAGE_APP[] PROGMEM =
   "}\n"
   "requestAnimationFrame(frame);\n"
   "render();load();setInterval(()=>{if(!busy&&!tm&&!dragging.size)load()},5000);\n"
+  "window.ledReload=()=>{if(!busy&&!tm&&!dragging.size)load()};\n"
   "})();\n"
   "</script></body></html>\n";
 
