@@ -4,6 +4,7 @@ plugins {
 }
 
 // Khoa ky: doc tu android/keystore/signing.properties (khoa cong khai cua du an, xem README). Dung chung cho CI va build tren may.
+def appVersionCode = Math.toIntExact((long) (System.currentTimeMillis() / 60000L))
 def ksProps = new Properties()
 rootProject.file('keystore/signing.properties').withInputStream { ksProps.load(it) }
 
@@ -16,7 +17,7 @@ android {
         minSdk 26
         targetSdk 34
         // versionCode phai LUON TANG thi moi cai de len ban cu. Dung so phut tu 1970 nen tang deu, khong phu thuoc so lan chay workflow.
-        versionCode (int) (System.currentTimeMillis() / 60000L)
+        versionCode appVersionCode
         versionName "1.0." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
     }
 
