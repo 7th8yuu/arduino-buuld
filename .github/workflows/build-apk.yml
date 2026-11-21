@@ -49,13 +49,13 @@ jobs:
           set -euo pipefail
           APK=android/app/build/outputs/apk/release/app-release.apk
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$BT/aapt2" dump badging "$APK" | grep -E "^(package|sdkVersion|targetSdkVersion|application-label|launchable-activity|uses-permission)" | tee badging.log
+          "$BT/aapt2" dump badging "$APK" | grep -E "^(package|sdkVersion|minSdkVersion|targetSdkVersion|application-label|launchable-activity|uses-permission)" | tee badging.log
           unzip -l "$APK" > files.log
           for f in assets/app.html assets/ui.css assets/shim.js classes.dex; do
             grep -q " $f\$" files.log || { echo "::error title=APK thieu file::$f"; exit 1; }
           done
           grep -q "name='com.ledctl.app'" badging.log
-          grep -q "sdkVersion:'26'" badging.log
+          grep -qE "^(min)?[sS]dkVersion:'26'" badging.log
           echo "APK co du giao dien web, ma Kotlin va khai bao dung"
 
       - name: Kiem tra chu ky
